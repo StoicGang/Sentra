@@ -68,9 +68,43 @@ def test_zeroize_memoryview():
 
     print("memoryview zeroize test passed!")
 
+def test_protect_from_fork():
+    """Test fork protection (Unix-only, no-op on windows)"""
+    sm = SecureMemory()
+    key = bytearray(b"Sensitive_key_for_fork_test!")
 
+    # should return true (either protected on Unix or no-op on windows)
+    result = sm.protect_from_fork(key)
+
+    assert result == True, "protect from_frok should succeed"
+    print ("protectd_from_fork() test passed!")
+
+def test_cleanup_all():
+    """Test cleanup of all locked regions"""
+    sm = SecureMemory()
+
+    # create and lock some data
+    key1 = bytearray(b"first_key_to_clean!")
+    key2 = bytearray(b"second_key_to_clean!")
+
+    sm.lock_memory(key1)
+    sm.lock_memory(key2)
+
+    # Verify regions are tracked
+    assert len(sm.locked_regions) >= 2, "Should have tracked regions"
+
+    # cleanup 
+    sm.cleanup_all()
+
+    # Verify regions cleared
+    assert len(sm.locked_regions) == 0, "Regions should be cleared"
+
+    print(" Cleanup_all() test passed")
 
 if __name__ == "__main__":
     test_platform_initialization()
     test_zeroize_bytearray()
     test_zeroize_memoryview()
+    test_protect_from_fork()
+    test_cleanup_all()
+    print("\n Memory is secure")

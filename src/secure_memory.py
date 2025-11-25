@@ -56,6 +56,8 @@ class SecureMemory:
         """Initialize secure memory manager and detect platform capabilities"""
         self.locked_regions = [] #track locked memory regions
         self._initialize_platform()
+
+        atexit.register(self.cleanup_all)
         pass
 
     def _initialize_platform(self):
@@ -230,7 +232,7 @@ class SecureMemory:
 
         return bool(locked_ok)
     
-    def _get_memory_address(self, data: bytes) -> Tuple[int, int]:
+    def _address_and_length(self, data: bytes) -> Tuple[int, int, object]:
         """
         Get memory address and size of bytes object
         
@@ -278,8 +280,6 @@ class SecureMemory:
             keeper = (ctypes.c_char * length).from_buffer(mv)
         addr = ctypes.addressof(keeper)
         return addr, length, keeper
-        
-
 
     def unlock_memory(self, data: bytes) -> bool:
         """
@@ -416,7 +416,7 @@ class SecureMemory:
         
         # TODO: Implement secure zeroing
         # HINTS:
-        # 1. Get memory address using _get_memory_address() helper
+        # 1. Get memory address using _address_and_length() helper
         # 2. Get length of data
         # 3. Use ctypes.memset(address, 0, length) to zero
         # 4. ctypes.memset signature: memset(void *ptr, int value, size_t num)
@@ -427,7 +427,7 @@ class SecureMemory:
         # - For bytearray/memoryview, zero directly
         # - Verify zeroing by checking first few bytes
         try:
-            addr, length, keeper = self._get_memory_address(data)
+            addr, length, keeper = self._address_and_length(data)
             ctypes.memset(addr, 0, length)
             # verify 
             first_byte = ctypes.cast(addr, ctypes.POINTER(ctypes.c_ubyte))[0]
@@ -438,6 +438,112 @@ class SecureMemory:
         except Exception as e:
             warnings.warn(f"SecureMemory: zeroize failed: {e}")
             return False
+        
+    def protect_from_fork(self, data: bytes) -> bool:
+        """
+         Prevent memory region from being copied to child processes on fork
+    
+        Args:
+            data: Bytes object to protect
+        
+        Returns:
+            True if protection applied
+            False if not supported or failed
+        
+        Security:
+            - Uses madvise(MADV_DONTFORK) on Unix
+            - Prevents child processes from inheriting sensitive memory
+            - Windows: Not applicable (no fork semantics)
+        
+        Example:
+            >>> sm.protect_from_fork(master_key)
+        """
 
+        # TODO: Implement fork protection
+        # HINTS:
+        # 1. This is Unix-only (linux/macos) - return true on windows (no-op)
+        # 2. Get memory address using _address_and_length()
+        # 3. Use libc.madvice(MADV_DONTFORK) on Unix
+        # 4. MADV_DONTFORK = 10 on Linux
+        # 5. Return True if successful
+
+        # Windows: No fork, so nothing to protect 
+        if IS_WINDOWS:
+            return True  # no-op here
+        if self.libc is None:
+            return False
         
+        try:
+            addr, length, keeper = self._address_and_length(data)
+
+            # MADV_DONTFORK = 10 on Linux
+            MADV_DONTFORK = 10
+
+            # Set up madvise if not already done
+            if not hasattr(self.libc, 'madvise'):
+                self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+                self.libc.madvise.restype = ctypes.c_int
+
+            result = self.libc.madvise(addr, length, MADV_DONTFORK)
+            return result == 0
         
+        except Exception as e:
+            warnings.warn(f"SecureMemory: fork protection failed: {e}")
+            return False
+        
+    def cleanup_all(self) -> None:
+        """
+        Zero and unlock all tracked memory regions
+
+        Security:
+            - Called automatically on exit via atexit
+            - Zeros all locked regions before unlocking
+            - Best-effort cleanup (doesn't raise exceptions)
+
+        Example:
+            >>> sm = SecureMemory()
+            >>> atexit.register(sm.cleanup_all)
+        """
+        # TODO: Implement cleanup
+        # HINTS:
+        # 1. Iterate over self.locked_regions
+        # 2. For each region that is still "locked":
+        #    a. Get the keeper object if stored
+        #    b. Zero the memory using ctypes.memset
+        #    c. Unlock the memory
+        # 3. Clear the locked_regions list
+        # 4. Don't raise exceptions (log warnings instead)
+
+        for region in self.locked_regions:
+            try: 
+                addr = region.get('addr')
+                length = region.get('length', 0)
+                locked = region.get('locked', False)
+
+                if addr is None or length ==0:
+                    continue
+
+                # Zero the memory first 
+                try:
+                    ctypes.memset(addr, 0, length)
+                except Exception:
+                    pass # Best efforts
+
+                # Unlock if it was locked
+
+                if locked:
+                    if IS_WINDOWS and self.kernel32:
+                        self.kernel32.VirtualUnlock(addr, length)
+                    elif self.libc and hasattr(self.libc, 'munlock'):
+                        self.libc.munlock(addr, length)
+
+                # clean up keeper reference
+                keeper_attr = f"_keeper_{addr}"
+                if hasattr(self, keeper_attr):
+                    delattr(self, keeper_attr)
+
+            except Exception as e:
+                pass # Best effort - Don't crash on cleanup
+
+        # Clear the list
+        self.locked_regions.clear()
