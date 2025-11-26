@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_failed_attempts_timestamp ON failed_attempts_log(
 -- FULL-TEXT SEARCH (FTS5) - For fast search functionality
 -- ============================================================================
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-    entry_id UNINDEXED,
+    id UNINDEXED,  -- changed from entry_id to id
     title,
     url,
     username,
@@ -97,13 +97,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 -- TRIGGERS to keep FTS in sync with entries table
 -- ============================================================================
 CREATE TRIGGER IF NOT EXISTS entries_fts_insert AFTER INSERT ON entries BEGIN
-    INSERT INTO entries_fts(rowid, entry_id, title, url, username, tags)
+    INSERT INTO entries_fts(rowid, id, title, url, username, tags)
     VALUES (new.rowid, new.id, new.title, new.url, new.username, new.tags);
 END;
 
 CREATE TRIGGER IF NOT EXISTS entries_fts_update AFTER UPDATE ON entries BEGIN
     UPDATE entries_fts 
-    SET title = new.title, url = new.url, username = new.username, tags = new.tags
+    SET id = new.id, title = new.title, url = new.url, username = new.username, tags = new.tags
     WHERE rowid = new.rowid;
 END;
 

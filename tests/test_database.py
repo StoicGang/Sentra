@@ -161,10 +161,413 @@ def test_unlock_timestamp_update():
 
     print("Unlock timestamp update test passed!")
 
+def test_add_entry_invalid_vault_key():
+    """Test add_entry with invalid vault key"""
+    test_db = "data/test_vault.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    # Try with wrong size vault key
+    try:
+        db.add_entry(
+            vault_key=b"too_short",  # Should be 32 bytes
+            title="Test Entry"
+        )
+        assert False, "Should raise DatabaseError"
+    except DatabaseError as e:
+        assert "Vault key must be 32 bytes" in str(e)
+        print("Invalid vault key error handled correctly")
+    
+    db.close()
+    os.remove(test_db)
+
+
+def test_get_nonexistent_entry():
+    """Test retrieving non-existent entry"""
+    test_db = "data/test_vault.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Try to get entry that doesn't exist
+    result = db.get_entry("nonexistent-id", vault_key)
+    
+    assert result is None, "Should return None for non-existent entry"
+    print("Non-existent entry returns None")
+    
+    db.close()
+    os.remove(test_db)
+
+
+def test_add_entry_success():
+    """Test successful entry creation"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    # Save vault metadata first
+    db.save_vault_metadata(
+        os.urandom(16), os.urandom(32), os.urandom(32),
+        os.urandom(12), os.urandom(16)
+    )
+    
+    vault_key = os.urandom(32)
+    
+    # Add entry
+    entry_id = db.add_entry(
+        vault_key=vault_key,
+        title="GitHub Account",
+        url="https://github.com",
+        username="testuser",
+        password="supersecret123",
+        notes="My GitHub credentials",
+        tags="dev,github",
+        category="Development"
+    )
+    
+    assert entry_id is not None
+    assert len(entry_id) == 36  # UUID length
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("add_entry success test passed!")
+
+
+def test_add_entry_invalid_vault_key():
+    """Test add_entry with invalid vault key"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    try:
+        # Try with wrong size vault key (should be 32 bytes)
+        db.add_entry(
+            vault_key=b"too_short",
+            title="Test Entry"
+        )
+        assert False, "Should raise DatabaseError"
+    except DatabaseError as e:
+        assert "Vault key must be 32 bytes" in str(e)
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("add_entry invalid vault key test passed!")
+
+
+def test_get_entry_success():
+    """Test successful entry retrieval and decryption"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Add entry
+    entry_id = db.add_entry(
+        vault_key=vault_key,
+        title="Test Entry",
+        url="https://example.com",
+        username="user@example.com",
+        password="mypassword123",
+        notes="Some notes here",
+        tags="test",
+        category="Personal"
+    )
+    
+    # Retrieve entry
+    entry = db.get_entry(entry_id, vault_key)
+    
+    assert entry is not None
+    assert entry["id"] == entry_id
+    assert entry["title"] == "Test Entry"
+    assert entry["url"] == "https://example.com"
+    assert entry["username"] == "user@example.com"
+    assert entry["password"] == "mypassword123"
+    assert entry["notes"] == "Some notes here"
+    assert entry["category"] == "Personal"
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("get_entry success test passed!")
+
+
+def test_get_nonexistent_entry():
+    """Test retrieving non-existent entry"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Try to get entry that doesn't exist
+    result = db.get_entry("nonexistent-uuid-here", vault_key)
+    
+    assert result is None, "Should return None for non-existent entry"
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("get_nonexistent_entry test passed!")
+
+
+def test_list_entries():
+    """Test listing all entries"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Add multiple entries
+    id1 = db.add_entry(vault_key=vault_key, title="Entry 1")
+    id2 = db.add_entry(vault_key=vault_key, title="Entry 2")
+    id3 = db.add_entry(vault_key=vault_key, title="Entry 3")
+    
+    # List all active entries
+    entries = db.list_entries(include_deleted=False)
+    
+    assert len(entries) == 3
+    titles = [e["title"] for e in entries]
+    assert "Entry 1" in titles
+    assert "Entry 2" in titles
+    assert "Entry 3" in titles
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("list_entries test passed!")
+
+
+def test_update_entry():
+    """Test updating entry fields"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Add entry
+    entry_id = db.add_entry(
+        vault_key=vault_key,
+        title="Original Title",
+        url="https://old.example.com",
+        password="oldpassword"
+    )
+    
+    # Update entry
+    result = db.update_entry(
+        entry_id=entry_id,
+        vault_key=vault_key,
+        title="Updated Title",
+        url="https://new.example.com",
+        password="newpassword123"
+    )
+    
+    assert result == True
+    
+    # Verify updates
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry["title"] == "Updated Title"
+    assert entry["url"] == "https://new.example.com"
+    assert entry["password"] == "newpassword123"
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("update_entry test passed!")
+
+
+def test_delete_entry_soft_delete():
+    """Test soft delete (move to trash)"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Add entry
+    entry_id = db.add_entry(vault_key=vault_key, title="To Delete")
+    
+    # Verify entry exists
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry is not None
+    
+    # Soft delete
+    result = db.delete_entry(entry_id)
+    assert result == True
+    
+    # Verify entry not in active list
+    entries = db.list_entries(include_deleted=False)
+    assert len(entries) == 0
+    
+    # Verify entry in trash
+    entries_in_trash = db.list_entries(include_deleted=True)
+    assert len(entries_in_trash) == 1
+    assert entries_in_trash[0]["is_deleted"] == 1
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("delete_entry soft delete test passed!")
+
+
+def test_restore_entry():
+    """Test restoring entry from trash"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # Add and delete entry
+    entry_id = db.add_entry(vault_key=vault_key, title="Restore Me")
+    db.delete_entry(entry_id)
+    
+    # Verify in trash
+    entries_in_trash = db.list_entries(include_deleted=True)
+    assert len(entries_in_trash) == 1
+    
+    # Restore
+    result = db.restore_entry(entry_id)
+    assert result == True
+    
+    # Verify back in active list
+    entries = db.list_entries(include_deleted=False)
+    assert len(entries) == 1
+    assert entries[0]["title"] == "Restore Me"
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("restore_entry test passed!")
+
+
+def test_entry_crud_roundtrip():
+    """Test complete CRUD cycle: Create, Read, Update, Delete, Restore"""
+    test_db = "data/test_vault_entry.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    vault_key = os.urandom(32)
+    
+    # CREATE
+    entry_id = db.add_entry(
+        vault_key=vault_key,
+        title="Gmail",
+        url="https://gmail.com",
+        username="user@gmail.com",
+        password="initial_password",
+        notes="Personal email account",
+        tags="email,important",
+        category="Email"
+    )
+    assert entry_id is not None
+    
+    # READ
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry["password"] == "initial_password"
+    
+    # UPDATE
+    result = db.update_entry(
+        entry_id=entry_id,
+        vault_key=vault_key,
+        password="new_password_2024",
+        notes="Updated notes"
+    )
+    assert result == True
+    
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry["password"] == "new_password_2024"
+    assert entry["notes"] == "Updated notes"
+    
+    # DELETE
+    result = db.delete_entry(entry_id)
+    assert result == True
+    
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry is None
+    
+    # RESTORE
+    result = db.restore_entry(entry_id)
+    assert result == True
+    
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry is not None
+    assert entry["password"] == "new_password_2024"
+    
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    
+    print("CRUD roundtrip test passed!")
+
 if __name__ == "__main__":
     test_database_connection()
     test_context_manager()
     test_database_initialization()
     test_vault_metadata_operations()
     test_unlock_timestamp_update()
+    test_add_entry_invalid_vault_key()
+    test_get_nonexistent_entry()
+    test_list_entries()
+    test_update_entry()
+    test_delete_entry_soft_delete()
+    test_restore_entry()
+    test_entry_crud_roundtrip()
     print("\n ALL DATABASE TESTS PASSED!")

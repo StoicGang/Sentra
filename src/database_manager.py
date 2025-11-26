@@ -5,10 +5,15 @@ Handles SQLit operations with encrypted entry storage and hierarchical key manag
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
+import warnings
+import json
 import uuid
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from src.crypto_engine import encrypt_entry, decrypt_entry, derive_master_key, generate_salt, generate_nonce, compute_auth_hash, compute_hmac
 
 class DatabaseError(Exception):
     """Base Exception for database operations"""
@@ -286,3 +291,538 @@ class DatabaseManager:
         conn.commit()
 
         return cursor.rowcount > 0 # True if row was updated
+    
+    def _derive_entry_key(self, vault_key: bytes, entry_id:str) -> bytes:
+        """ 
+        Derive entry specific encryption key from vault key
+        
+        Args: 
+            - vault_key: 32-bytes vault key
+            - entry_id: Entry UUID string
+
+        Returns:
+            32-byte entry-specific key
+        """
+        # Encrypt the entry_key
+        entry_key  = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=entry_id.encode()
+        ).derive(vault_key)
+
+        return entry_key
+
+    def add_entry(
+            self, 
+            vault_key: bytes, 
+            title: str, 
+            url: Optional[str] = None,
+            username: Optional[str] = None, 
+            password: Optional[str] = None, 
+            notes: Optional[str] = None, 
+            tags: Optional[str] = None, 
+            category: str = "General"
+    ) -> str:
+        """ 
+        Add new encrypted entry to vault
+        
+        Args:
+            - vault_key: Vault encryption key 
+            - title: Entry title (plaintext, searchable)
+            - url: Optional[str] = Website URL (plaintext, searchable)
+            - username: Optional[str] = Username/email (plaintext, searchable)
+            - password: Optional[str] = Password (will be encrypted)
+            - notes: Optional[str] = Additional notes (will be encrypted)
+            - tags: Optional[str] = Comma-separated tags (plaintext, searchable)
+            - category: str = Entry category
+
+        Returns
+            - Entry UUID
+        
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        # TODO: Implement entry creation with encryption
+        # HINTS:
+        # 1. Generate UUID for entry: entry_id = str(uuid.uuid4())
+        # 2. Derive entry-specific key from vault_key using HKDF:
+        # from cryptography.hazmat.primitives import hashes
+        # from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        # entry_key = HKDF(
+        #     algorithm=hashes.SHA256(),
+        #     length=32,
+        #     salt=None,
+        #     info=entry_id.encode()
+        # ).derive(vault_key)
+        # 3. Import crypto functions:
+        # from crypto_engine import encrypt_entry, generate_nonce
+        # 4. Prepare data dict: {"password": password, "notes": notes}
+        # 5. Encrypt data: ciphertext, nonce, tag = encrypt_entry(data, entry_key)
+        # 6. Get current timestamp: datetime.now().isoformat()
+        # 7. INSERT INTO entries with encrypted password and notes
+        # 8. Commit and return entry_id
+        # 
+        # SQL Example:
+        #     INSERT INTO entries (
+        #         id, title, url, username,
+        #         password_encrypted, password_nonce, password_tag,
+        #         notes_encrypted, notes_nonce, notes_tag,
+        #         tags, category, created_at, modified_at
+        #     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        try:
+            # Validate inputs
+            if not title or not isinstance(title, str):
+                raise ValueError("Entry title must be a non-empty string")
+            
+            if not isinstance(vault_key, bytes) or len(vault_key) != 32:
+                raise ValueError("Vault key must be 32 bytes")
+            
+            # Generate the UUID
+            entry_id = str(uuid.uuid4())
+            
+            # Derive the entry key
+            entry_key = self._derive_entry_key(vault_key, entry_id)
+            
+            # Prepare the data
+            payload = {
+                "password": password or "",
+                "notes": notes or ""
+            }
+
+            payload_json = json.dumps(payload)
+            
+            # Encrypt the data
+            ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+            
+            # Timestamp
+            now = datetime.now(timezone.utc).isoformat()
+            
+            # Insert into entries
+            conn = self.connect()
+            conn.execute("""
+                INSERT INTO entries (
+                    id, title, url, username,
+                    password_encrypted, password_nonce, password_tag,
+                    notes_encrypted, notes_nonce, notes_tag,
+                    tags, category, created_at, modified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry_id,
+                title, url, username,
+                ciphertext, nonce, tag,
+                ciphertext, nonce, tag,
+                tags, category, now, now
+            ))
+            
+            conn.commit()
+            return entry_id
+            
+        except ValueError as e:
+            raise DatabaseError(f"Invalid entry data: {str(e)}")
+        except sqlite3.IntegrityError as e:
+            raise DatabaseError(f"Entry already exists or constraint violation: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database operation failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error during entry creation: {str(e)}")
+    
+    def get_entry(self, entry_id: str, vault_key: bytes) -> Optional[Dict]:
+        """ 
+        Retriev and decrypt entry by ID
+        
+        Args:
+            - entry_id: Entry UUID
+            - vault_key: Vault encryption key
+            
+        Returns:
+            Dictionary with decrypted entry data:
+            {
+                'id': str,
+                'title': str,
+                'url': str,
+                'username': str,
+                'password': str,  # Decrypted
+                'notes': str,     # Decrypted
+                'tags': str,
+                'category': str,
+                'created_at': str,
+                'modified_at': str,
+                'last_accessed_at': str
+            }
+            None if entry not found or is deleted
+            
+        Raises:
+            - DatabaseError: If decryption fails
+        """
+         
+        # TODO: Implement entry retrieval with decryption
+        # HINTS:
+        # 1. Query: SELECT * FROM entries WHERE id = ? AND is_deleted = 0
+        # 2. If no row found, return None
+        # 3. Derive entry_key using same HKDF as add_entry()
+        # 4. Import: from crypto_engine import decrypt_entry
+        # 5. Decrypt password field:
+        #    decrypted_data = decrypt_entry(
+        #        row['password_encrypted'],
+        #        row['password_nonce'],
+        #        row['password_tag'],
+        #        entry_key
+        #    )
+        # 6. Update last_accessed_at timestamp
+        # 7. Return combined dict (metadata + decrypted fields)
+
+        try:
+            # Validate inputs
+            if not entry_id or not isinstance(entry_id, str):
+                raise ValueError("Entry ID must be a non-empty string")
+            
+            if not isinstance(vault_key, bytes) or len(vault_key) != 32:
+                raise ValueError("Vault key must be 32 bytes")
+            
+            conn = self.connect()
+            
+            cursor = conn.execute(
+                "SELECT * FROM entries WHERE id = ? AND is_deleted = 0", 
+                (entry_id,)
+            )
+            
+            row = cursor.fetchone()
+            
+            if row is None:
+                return None  # Entry not found is not an error
+            
+            # Derive entry-specific key
+            entry_key = self._derive_entry_key(vault_key, entry_id)
+            
+            # Decrypt password field
+            try:
+                password_data = decrypt_entry(
+                    row["password_encrypted"],
+                    row["password_nonce"],
+                    row["password_tag"],
+                    entry_key
+                )
+                password_dict = json.loads(password_data)
+                password = password_dict.get("password")
+            except Exception as e:
+                warnings.warn(f"Failed to decrypt password for entry {entry_id}: {str(e)}")
+                password = None
+            
+            # Decrypt notes field
+            try:
+                notes_data = decrypt_entry(
+                    row["notes_encrypted"],
+                    row["notes_nonce"],
+                    row["notes_tag"],
+                    entry_key
+                )
+                notes_dict = json.loads(notes_data)
+                notes = notes_dict.get("notes")
+            except Exception as e:
+                warnings.warn(f"Failed to decrypt notes for entry {entry_id}: {str(e)}")
+                notes = None
+            
+            # Update last accessed timestamp
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                conn.execute(
+                    "UPDATE entries SET last_accessed_at = ? WHERE id = ?",
+                    (now, entry_id)
+                )
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                warnings.warn(f"Failed to update last_accessed_at: {str(e)}")
+            
+            # Return combined dict
+            entry = {
+                "id": row["id"],
+                "title": row["title"],
+                "url": row["url"],
+                "username": row["username"],
+                "tags": row["tags"],
+                "category": row["category"],
+                "created_at": row["created_at"],
+                "modified_at": row["modified_at"],
+                "last_accessed_at": now,
+                "password": password,
+                "notes": notes,
+            }
+            
+            return entry
+            
+        except ValueError as e:
+            raise DatabaseError(f"Invalid input: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database query failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error retrieving entry: {str(e)}")
+
+    
+    def update_entry(
+            self,
+            entry_id: str, 
+            vault_key: bytes, 
+            title: Optional[str] = None,
+            url: Optional[str] = None, 
+            username: Optional[str] = None,
+            password: Optional[str] = None,
+            notes: Optional[str] = None, 
+            tags: Optional[str] = None, 
+            category: Optional[str] = None
+    )->bool:
+        """ 
+        Update existing entry (only provided fields)
+
+        Args:
+            - entry_id: Entry UUID
+            - vault_key: Vault encryption key
+            - **kwargs: Fields to update (None = no change)
+
+        Returns:
+            - True if updated successfully
+            - False if entry not found
+
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        # TODO: Implement entry update
+        # HINTS:
+        # 1. Check if entry exists: SELECT id FROM entries WHERE id = ? AND is_deleted = 0
+        # 2. If not found, return False
+        # 3. Build UPDATE query dynamically for non-None fields
+        # 4. If password or notes changed, re-encrypt with same entry_key
+        # 5. Always update modified_at timestamp
+        # 6. Commit and return True
+        # 
+        # SQL Example:
+        #     UPDATE entries 
+        #     SET title = ?, url = ?, password_encrypted = ?, modified_at = ?
+        #     WHERE id = ?
+
+        try:
+            # Validate inputs
+            if not entry_id or not isinstance(entry_id, str):
+                raise ValueError("Entry ID must be a non-empty string")
+            
+            if not isinstance(vault_key, bytes) or len(vault_key) != 32:
+                raise ValueError("Vault key must be 32 bytes")
+            
+            conn = self.connect()
+            
+            # Check if entry exists
+            cursor = conn.execute(
+                "SELECT id FROM entries WHERE id = ? AND is_deleted = 0",
+                (entry_id,)
+            )
+            
+            if cursor.fetchone() is None:
+                return False  # Entry not found
+            
+            fields = []
+            values = []
+            
+            # Build update query dynamically
+            if title is not None:
+                fields.append("title = ?")
+                values.append(title)
+            
+            if url is not None:
+                fields.append("url = ?")
+                values.append(url)
+            
+            if username is not None:
+                fields.append("username = ?")
+                values.append(username)
+            
+            if tags is not None:
+                fields.append("tags = ?")
+                values.append(tags)
+            
+            if category is not None:
+                fields.append("category = ?")
+                values.append(category)
+            
+            # If password or notes changed, re-encrypt
+            if password is not None or notes is not None:
+                entry_key = self._derive_entry_key(vault_key, entry_id)
+                
+                if password is not None:
+                    payload = {"password": password}
+                    payload_json = json.dumps(payload)
+                    ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+                    fields.extend(["password_encrypted = ?", "password_nonce = ?", "password_tag = ?"])
+                    values.extend([ciphertext, nonce, tag])
+                
+                if notes is not None:
+                    payload = {"notes": notes}
+                    payload_json = json.dumps(payload)
+                    ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+                    fields.extend(["notes_encrypted = ?", "notes_nonce = ?", "notes_tag = ?"])
+                    values.extend([ciphertext, nonce, tag])
+            
+            # If no fields to update, return True (nothing to do)
+            if not fields:
+                return True
+            
+            # Always update modified_at
+            now = datetime.now(timezone.utc).isoformat()
+            fields.append("modified_at = ?")
+            values.append(now)
+            
+            # Build SQL correctly
+            set_clause = ", ".join(fields)
+            sql = f"UPDATE entries SET {set_clause} WHERE id = ?"
+            values.append(entry_id)
+
+            # Execute
+            conn.execute(sql, tuple(values))
+            conn.commit()
+            
+            return True
+            
+        except ValueError as e:
+            raise DatabaseError(f"Invalid input: {str(e)}")
+        except sqlite3.IntegrityError as e:
+            raise DatabaseError(f"Update violates constraints: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database operation failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error updating entry: {str(e)}")
+
+    
+    def delete_entry(self, entry_id: str) -> bool:
+        """
+        Soft delete entry (move to trash)
+        
+        Args:
+            entry_id: Entry UUID
+        
+        Returns:
+            True if deleted successfully
+            False if entry not found
+        
+        Raises:
+            DatabaseError: If database operation fails
+        """
+        # TODO: Implement soft delete
+        # HINTS:
+        # 1. UPDATE entries SET is_deleted = 1, deleted_at = ? WHERE id = ?
+        # 2. Check cursor.rowcount > 0 to verify row was updated
+        # 3. Commit and return result
+        try:
+            # Validate input
+            if not entry_id or not isinstance(entry_id, str):
+                raise ValueError("Entry ID must be a non-empty string")
+            
+            conn = self.connect()
+            
+            deleted_at = datetime.now(timezone.utc).isoformat()
+            
+            cursor = conn.execute(
+                "UPDATE entries SET is_deleted = 1, deleted_at = ? WHERE id = ? AND is_deleted = 0",
+                (deleted_at, entry_id)
+            )
+            
+            if cursor.rowcount > 0:
+                conn.commit()
+                return True
+            else:
+                return False  # Entry not found or already deleted
+                
+        except ValueError as e:
+            raise DatabaseError(f"Invalid input: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database operation failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error deleting entry: {str(e)}")
+
+        
+    def list_entries(self, include_deleted: bool = False) -> List[Dict]:
+        """ 
+        List all entries (metadata only, no decryption)
+        
+        Args:
+            - include_deleted: Include soft-deleted entries in trash
+        
+        Returns:
+            - List of entry metadata dictionaries (passwords NOT decrypted)
+        """
+        # TODO: Implement entry listing
+        # HINTS:
+        # 1. SELECT id, title, url, username, tags, category, created_at, modified_at
+        # FROM entries
+        # WHERE is_deleted = 0 (or 1 if include_deleted)
+        # 2. Convert rows to list of dicts
+        # 3. Return list (may be empty)
+        
+        try:
+            conn = self.connect()
+            
+            if include_deleted:
+                cursor = conn.execute("""
+                    SELECT id, title, url, username, tags, category, created_at, modified_at, is_deleted, deleted_at
+                    FROM entries
+                """)
+            else:
+                cursor = conn.execute("""
+                    SELECT id, title, url, username, tags, category, created_at, modified_at
+                    FROM entries
+                    WHERE is_deleted = 0
+                """)
+            
+            rows = cursor.fetchall()
+            
+            # Convert rows to list of dicts
+            entries = [dict(row) for row in rows]
+            
+            return entries
+            
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database query failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error listing entries: {str(e)}")
+    
+    def restore_entry(self, entry_id: str) -> bool:
+        """
+        Restore soft-deleted entry from trash
+        
+        Args:
+            - entry_id: Entry UUID
+        
+        Returns:
+            - True if restored successfully
+            - False if entry not found in trash
+        """
+        # TODO: Implement entry restoration
+        # HINTS:
+        # 1. UPDATE entries SET is_deleted = 0, deleted_at = NULL WHERE id = ? AND is_deleted = 1
+        # 2. Check cursor.rowcount > 0
+        # 3. Commit and return result
+        
+        try:
+            # Validate input
+            if not entry_id or not isinstance(entry_id, str):
+                raise ValueError("Entry ID must be a non-empty string")
+            
+            conn = self.connect()
+            
+            now = datetime.now(timezone.utc).isoformat()
+            
+            cursor = conn.execute(
+                "UPDATE entries SET is_deleted = 0, deleted_at = NULL, modified_at = ? WHERE id = ? AND is_deleted = 1",
+                (now, entry_id)
+            )
+            
+            if cursor.rowcount > 0:
+                conn.commit()
+                return True
+            else:
+                return False  # Entry not found in trash
+                
+        except ValueError as e:
+            raise DatabaseError(f"Invalid input: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database operation failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error restoring entry: {str(e)}")
