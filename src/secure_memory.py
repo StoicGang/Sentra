@@ -58,7 +58,6 @@ class SecureMemory:
         self._initialize_platform()
 
         atexit.register(self.cleanup_all)
-        pass
 
     def _initialize_platform(self):
         """
@@ -191,7 +190,7 @@ class SecureMemory:
             warnings.warn(f"SecureMemory: unable to get buffer address: {e}")
             self.locked_regions.append({
                 "addr": None, "length":len(data) if hasattr(data, "__len__") else None,
-                "locked": False, "platfomr": sys.platform
+                "locked": False, "platform": sys.platform
             })
             return False
         
@@ -223,10 +222,10 @@ class SecureMemory:
             warnings.warn(f"SecureMemory: memory lock failed")
 
         if locked_ok and keeper is not None:
-            setattr(self, f"_keeper_{addr}", keeper)
+            setattr(self, f"_keeper_{id(data)}", keeper)
 
         self.locked_regions.append({
-            "addr": addr, "length": length, "locked": bool(locked_ok),
+            "addr": addr, "length": length, "locked": bool(locked_ok), "id": id(data),
             "platform": ("Windows" if IS_WINDOWS else "unix" if (IS_LINUX or IS_MACOS) else sys.platform)
         })
 
@@ -250,6 +249,14 @@ class SecureMemory:
         # 
         # Note: In Python, bytes are immutable and stored contiguously,
         # so we can reliably get their memory address
+
+        # 1. Check if we already have a locked keeper for this object ID
+        keeper_name = f"_keeper_{id(data)}"
+        if hasattr(self, keeper_name):
+            keeper = getattr(self, keeper_name)
+            addr = ctypes.addressof(keeper)
+            length = len(keeper)
+            return addr, length, keeper
 
         if not isinstance(data, (bytes,bytearray, memoryview)):
             raise TypeError("lock_memory expects bytes/bytearray/memoryview")
@@ -323,21 +330,39 @@ class SecureMemory:
         unlocked_ok = False
 
         if IS_WINDOWS and self.kernel32 is not None:
-            ok = bool(self.kernel32.VirtualUnlock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
-            unlocked_ok  = ok
+            # 1. Capture the return value directly
+            ret = self.kernel32.VirtualUnlock(ctypes.c_void_p(addr), ctypes.c_size_t(length))
+            
+            # 2. Check if it succeeded OR if the failure was harmless (Error 158)
+            if ret:
+                unlocked_ok = True
+            else:
+                err = ctypes.get_last_error()
+                # Accept 158 (Already Unlocked), 487 (Invalid Address), and 0 (Success)
+                if err in (158, 487, 0): 
+                    unlocked_ok = True
+                else:
+                    unlocked_ok = False
 
         elif (IS_LINUX or IS_MACOS) and self.libc is not None and hasattr(self.libc, "munlock"):
             rc = int (self.libc.munlock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
             unlocked_ok = (rc == 0)
         else:
-            warnings.warn("SecureMemory: unlocking not supported on the platfomr: degraded mode")
+            warnings.warn("SecureMemory: unlocking not supported on the platform: degraded mode")
             unlocked_ok = False
+
+        if unlocked_ok:
+            for region in self.locked_regions:
+                # Find the record matching this ID
+                if region.get('id') == id(data):
+                    region['locked'] = False # Mark as unlocked so cleanup_all skips it
 
         if not unlocked_ok:
             warnings.warn(f"SecureMemory: memory unlock failed")
 
-        if hasattr(self, f"_keeper_{addr}"):
-            delattr(self, f"__keeper_{addr}")
+        keeper_name = f"_keeper_{id(data)}"
+        if hasattr(self, keeper_name):
+            delattr(self, keeper_name)
 
         self.locked_regions.append({
             "addr": addr, "length": length, "locked": False,
@@ -519,6 +544,7 @@ class SecureMemory:
                 addr = region.get('addr')
                 length = region.get('length', 0)
                 locked = region.get('locked', False)
+                data_id = region.get('id')
 
                 if addr is None or length ==0:
                     continue
@@ -538,9 +564,10 @@ class SecureMemory:
                         self.libc.munlock(addr, length)
 
                 # clean up keeper reference
-                keeper_attr = f"_keeper_{addr}"
-                if hasattr(self, keeper_attr):
-                    delattr(self, keeper_attr)
+                if data_id:
+                    keeper_attr = f"_keeper_{data_id}"
+                    if hasattr(self, keeper_attr):
+                        delattr(self, keeper_attr)
 
             except Exception as e:
                 pass # Best effort - Don't crash on cleanup

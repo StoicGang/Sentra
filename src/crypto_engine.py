@@ -213,10 +213,13 @@ def compute_auth_hash(
     # 2. password.encode('utf-8') for bytes
     # 3. Return 32-byte hash (dklen=32)
 
-    password = password.encode('utf-8')
+    if isinstance(password, str):
+        password_bytes = password.encode('utf-8')
+    else:
+        password_bytes = password
     auth_hash = hashlib.pbkdf2_hmac(
         'sha256',   # Hash algorithm
-        password,   # Password as bytes
+        password_bytes,   # Password as bytes
         salt,       # Salt
         iterations, # Iteration count
         dklen = 32  # Derived key length
