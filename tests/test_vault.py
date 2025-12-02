@@ -1,9 +1,8 @@
 import os
 import pytest
-import gc # Added for Windows file lock handling
+import gc 
 from src.vault_controller import VaultController, VaultLockedError, VaultError, VaultAlreadyUnlockedError
 
-# --- FIX START: Use a fixture for reliable setup and teardown ---
 @pytest.fixture
 def vault():
     """Fixture to provide a clean vault controller for each test"""
@@ -46,7 +45,6 @@ def vault():
             os.remove(db_path)
         except PermissionError:
             pass
-# --- FIX END ---
 
 def test_vault_unlock_and_lock(vault): # Pass fixture
     # Initial unlock should succeed (new vault)
@@ -127,3 +125,60 @@ def test_data_is_destroyed_after_lock(vault):
     # Since bytearray is mutable, the change happens in-place.
     # If this passes, it proves the memory was securely wiped.
     assert all(b == 0 for b in sensitive_data_ref), "Security Breach: Key was not zeroized in memory!"
+
+def test_search_entries(vault):
+    # Ensure vault is unlocked before searching
+    vault.unlock_vault("StrongPassword123!")
+
+    # Setup: Add sample entries
+    e1_id = vault.add_password(
+        title="Example Entry",
+        url="https://example.com",
+        username="user1",
+        password="pass1",
+        tags="email,personal",
+        category="Email"
+    )
+    e2_id = vault.add_password(
+        title="Old Entry",
+        url="https://old.com",
+        username="user2",
+        password="pass2",
+        tags="work,archive",
+        category="Work"
+    )
+    
+    # Soft delete second entry
+    vault.db.mark_entry_deleted(e2_id)
+
+    # 1. Search existing keyword
+    results = vault.search_entries("example")
+    assert isinstance(results, list)
+    assert any("example" in entry["title"].lower() for entry in results)
+
+    # 2. Search with include_deleted=False
+    results_no_deleted = vault.search_entries("old", include_deleted=False)
+    # Updated key: isdeleted -> is_deleted
+    assert all(entry.get("is_deleted", 0) == 0 for entry in results_no_deleted)
+
+    # 3. Search with include_deleted=True
+    results_with_deleted = vault.search_entries("old", include_deleted=True)
+    # Updated key: isdeleted -> is_deleted
+    assert any(entry.get("is_deleted", 0) == 1 for entry in results_with_deleted)
+
+    # 4. Check vault locked behavior
+    vault.lock_vault()
+    try:
+        vault.search_entries("test")
+        assert False, "Search should fail when vault is locked."
+    except VaultLockedError:
+        pass
+
+
+if __name__ == "__main__":
+    test_add_and_get_password_success()
+    test_add_password_invalid_title()
+    test_add_password_locked_fails()
+    test_search_entries()
+    test_data_is_destroyed_after_lock()
+    test_vault_unlock_and_lock()

@@ -7,12 +7,12 @@ from typing import Optional, List, Dict
 from datetime import datetime, timezone
 import warnings
 import json
+from src.adaptive_lockout import AdaptiveLockout
 import base64
 from src.crypto_engine import (
     derive_master_key,
     compute_auth_hash, 
-    generate_salt, 
-    generate_nonce,
+    generate_salt,
     encrypt_entry,
     decrypt_entry,
     generate_key
@@ -48,7 +48,7 @@ class VaultController:
         - Fail-fast: All operations check is_unlocked flag
     """
 
-    def __init__(self, db_path: str = "data/vault.db"):
+    def __init__(self, db_path: str = "data/vault.db",config: Optional[Dict] = None):
         """ 
         Initialize vault controller 
         
@@ -57,6 +57,10 @@ class VaultController:
         """
         self.db = DatabaseManager(db_path)
         self.secure_mem = SecureMemory()
+
+        # Adaptive lockout manager
+        self.config = config or {}
+        self.adaptive_lockout = AdaptiveLockout(self.db, self.config)
 
         # State flags
         self.is_unlocked = False
@@ -118,8 +122,12 @@ class VaultController:
         # 9. Return True
 
         if self.is_unlocked:
-            raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.")
+            raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.") 
         
+        allowed, delay = self.adaptive_lockout.check_and_delay()
+        if not allowed:
+            raise VaultError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
+
         if not password or not isinstance(password, str):
             raise VaultError("Password must be a non-empty string")
         
@@ -206,7 +214,11 @@ class VaultController:
             # verify password
             master_key_b64 = base64.b64encode(master_key).decode('utf-8')
             if compute_auth_hash(master_key_b64, salt=metadata["salt"]) != metadata["auth_hash"]:
+                self.adaptive_lockout.record_failure()
                 raise VaultError("Invalid password")
+            
+            # On successful unlock:
+            self.adaptive_lockout.reset_session()   
             
             # Decrypt vault key 
             try:
@@ -396,28 +408,32 @@ class VaultController:
         Raises:
             VaultLockedError: If vault locked
             VaultError: If search fails
+
+        Security:
+        - Ensures vault unlocked before access.
+        - Uses parameterized queries to prevent SQL injection.
+        - Returns non-sensitive metadata only.
         
         """
         # TODO: Implement search_entries with unlock check
 
-        self._check_unlocked() 
+        self._check_unlocked()
 
         try:
             conn = self.db.connect()
-            # FTS5 match query search 
-            # use parameterized MATCH query to prevent injection
             search_query = f"{query.strip()}"
-
+            
             sql = """
-                SELECT e.id, e.title, url, e.username, e.tags, e.category, e.created_at, e.modified_at
+                SELECT e.id, e.title, e.url, e.username, e.tags, e.category, e.created_at, e.modified_at, e.is_deleted
                 FROM entries e
-                JOIN entries_fts fts ON e.rowid = fts.rowid
-                WHERE fts MATCH ?
+                JOIN entries_fts ON e.rowid = entries_fts.rowid      
+                WHERE entries_fts MATCH ?
             """
 
             params = [search_query] 
+            
             if not include_deleted:
-                sql += " AND e.isdeleted = 0"
+                sql += " AND e.is_deleted = 0"
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()

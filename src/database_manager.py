@@ -558,7 +558,6 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error retrieving entry: {str(e)}")
 
-    
     def update_entry(
             self,
             entry_id: str, 
@@ -737,7 +736,6 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error deleting entry: {str(e)}")
 
-        
     def list_entries(self, include_deleted: bool = False) -> List[Dict]:
         """ 
         List all entries (metadata only, no decryption)
@@ -826,3 +824,34 @@ class DatabaseManager:
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
             raise DatabaseError(f"Unexpected error restoring entry: {str(e)}")
+        
+    def mark_entry_deleted(self, entry_id: str) -> None:
+        """
+        Mark an entry as soft-deleted in the database by setting its is_deleted flag.
+        
+        Args:
+            entry_id: The UUID of the entry to soft-delete.
+            
+        Raises:
+            DatabaseError: If update fails.
+        """
+        try:
+            # Use Python datetime to match the format used in add_entry/update_entry
+            deleted_at = datetime.now(timezone.utc).isoformat()
+            
+            # Corrected column names: isdeleted -> is_deleted, deletedat -> deleted_at
+            # Removed autodeleteat as it likely doesn't exist in your schema based on other methods
+            sql = """
+            UPDATE entries
+            SET is_deleted = 1,
+                deleted_at = ?
+            WHERE id = ?
+            """
+            
+            # Ensure connection is open
+            conn = self.connect()
+            conn.execute(sql, (deleted_at, entry_id))
+            conn.commit()
+            
+        except Exception as e:
+            raise DatabaseError(f"Failed to mark entry as deleted: {e}")
