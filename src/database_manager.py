@@ -689,7 +689,6 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error updating entry: {str(e)}")
 
-    
     def delete_entry(self, entry_id: str) -> bool:
         """
         Soft delete entry (move to trash)
@@ -855,3 +854,37 @@ class DatabaseManager:
             
         except Exception as e:
             raise DatabaseError(f"Failed to mark entry as deleted: {e}")
+        
+    def get_metadata(self, key: str) -> Optional[str]:
+        """
+        Retrieve metadata value or None if not found.
+        Used by AdaptiveLockout.
+        """
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,)
+            ).fetchone()
+            return row["value"] if row else None
+        except Exception:
+            return None
+
+    def update_metadata(self, key: str, value: str) -> bool:
+        """
+        Upsert metadata key/value into metadata table.
+        """
+        conn = self.connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO metadata (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value)
+            )
+            conn.commit()
+            return True
+        except Exception:
+            return False

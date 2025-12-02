@@ -110,3 +110,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS entries_fts_delete AFTER DELETE ON entries BEGIN
     DELETE FROM entries_fts WHERE rowid = old.rowid;
 END;
+
+-- ========================================================================
+-- TABLE 4: metadata (for adaptive lockout + future config)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
