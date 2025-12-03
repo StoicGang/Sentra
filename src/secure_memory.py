@@ -83,7 +83,7 @@ class SecureMemory:
         """
 
         # TODO: Platformmnh-specific initialization
-        if IS_LINUX or IS_MACOS:
+        if IS_LINUX:
             try:
                 # Load linux libc
                 self.libc = ctypes.CDLL('libc.so.6')

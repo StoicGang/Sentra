@@ -45,7 +45,6 @@ def generate_salt(length: int = 16) -> bytes:
         >>> salt == generate_salt() # different every time 
         false    
     """
-    # TODO: Implement using os.urandom() --> it returns n random bytes 
     result = os.urandom(length)
     return result
 
@@ -71,7 +70,6 @@ def generate_nonce(length: int = 12) -> bytes:
         >>> len(nonce)
         12 
     """
-    # TODO: Implement using os.urandom()
     result = os.urandom(length)
     return result
 
@@ -96,16 +94,10 @@ def generate_key(length: int = 32) -> bytes:
         >>> len(key)
         32
     """
-    #TODO: Implement using secrets.token_bytes()
     result = secrets.token_bytes(length)
     return result
     #WHY secrets instead of os.urandom? secrets is explicitly designed for crypto more randomness allowed by the OS
 
-"""
-=============================================================================================
-PART B: KEY DERIVATION (Argon2id)
-=============================================================================================
-"""
 # function to derive the master key
 def derive_master_key(
     password: str,
@@ -462,13 +454,13 @@ def compute_hmac(data: bytes, key: bytes, algorithm: str = 'sha256') -> bytes:
         >>> compute_hmac(tampered_data, key) == hmac_tag
         False
     """
-    # TODO: Implement HMAC computation
-    # HINTS:
-    # 1. Use hashlib.new(algorithm)
-    # 2. Create HMAC object with key
-    # 3. Update with data
-    # 4. Return digest()
-    
     h = hmac.new(key, data, hashlib.sha256)
 
     return h.digest()
+
+def verify_auth_hash(stored_hash: bytes, password: str, salt: bytes) -> bool:
+    """
+    Verify password against stored hash using constant-time comparison.
+    """
+    computed = compute_auth_hash(password, salt)
+    return hmac.compare_digest(computed, stored_hash)

@@ -174,6 +174,59 @@ def test_search_entries(vault):
     except VaultLockedError:
         pass
 
+def test_auto_password_strength(vault):
+    """Test that adding a password automatically calculates strength"""
+    vault.unlock_vault("StrongPassword123!")
+
+    # 1. Add a WEAK password
+    weak_id = vault.add_password(
+        title="Weak Entry",
+        password="123"
+    )
+    
+    # 2. Add a STRONG password
+    strong_id = vault.add_password(
+        title="Strong Entry",
+        password="Correct-Horse-Battery-Staple-99!"
+    )
+
+    # 3. Verify scores
+    weak_entry = vault.get_password(weak_id)
+    strong_entry = vault.get_password(strong_id)
+
+    # Note: Exact score depends on your alg, but weak should be low, strong high
+    assert weak_entry['password_strength'] < 50, "Weak password should have low score"
+    assert strong_entry['password_strength'] > 50, "Strong password should have high score"
+
+def test_favorites_handling(vault):
+    """Test toggling favorite status via controller"""
+    vault.unlock_vault("StrongPassword123!")
+
+    # Add as favorite
+    entry_id = vault.add_password(
+        title="My Favorite",
+        password="pass",
+        favorite=True
+    )
+
+    entry = vault.get_password(entry_id)
+    assert entry['favorite'] is True
+
+def test_audit_log_access(vault):
+    """Test accessing audit logs via controller"""
+    vault.unlock_vault("StrongPassword123!")
+
+    # Create activity
+    vault.add_password(title="Log Entry 1")
+    vault.add_password(title="Log Entry 2")
+
+    # Fetch logs
+    logs = vault.view_audit_log()
+    
+    assert isinstance(logs, list)
+    assert len(logs) >= 2
+    assert logs[0]['action_type'] == 'CREATE'
+
 
 if __name__ == "__main__":
     test_add_and_get_password_success()
@@ -182,3 +235,7 @@ if __name__ == "__main__":
     test_search_entries()
     test_data_is_destroyed_after_lock()
     test_vault_unlock_and_lock()
+    test_auto_password_strength() 
+    test_favorites_handling()     
+    test_audit_log_access()
+    print("\n all test cases passed")

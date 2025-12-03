@@ -63,16 +63,6 @@ class DatabaseManager:
         Returns:
             SQLite connection object with Row factory    
         """
-        # TODO: Implement database connection
-        # HINTS:
-        # 1. Check if self.connection exists and is open
-        # 2. If not, create new connection: sqlite3.connect(self.db_path)
-        # 3. Set row_factory to sqlite3.Row for dict-like access:
-        #   connection.row_factory = sqlite3.Row
-        # 4. Enable foreign keys: connection.execute("PRAGMA foreign_keys = ON")
-        # 5. Enable write-ahead logging for concurrency:
-        #   connection.execute("PRAGMA journal_mode = WAL")
-        # 6. Return connection
         if self.connection is None:
             self.connection = sqlite3.connect(self.db_path)
             self.connection.row_factory  = sqlite3.Row  # Dict-like rows
@@ -162,7 +152,8 @@ class DatabaseManager:
             auth_hash: bytes, 
             vault_key_encrypted: bytes, 
             vault_key_nonce: bytes, 
-            vault_key_tag:bytes
+            vault_key_tag:bytes,
+            kdf_config: Optional[Dict] = None
     ) -> bool:
         """
         Save vault initialization metadata to database
@@ -181,22 +172,6 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
-        # TODO: Implement vault metadata save
-        # HINTS:
-        # 1. Check if vault already initialized (id=1 exists in vault_metadata)
-        # 2. If exists, return False
-        # 3. Get current timestamp: datetime.now().isoformat()
-        # 4. INSERT INTO vault_metadata with all fields
-        # 5. Commit transaction
-        # 6. Return True
-        # 
-        # SQL Example:
-        #     INSERT INTO vault_metadata (
-        #         id, salt, auth_hash, 
-        #         vault_key_encrypted, vault_key_nonce, vault_key_tag,
-        #         created_at, version
-        #     ) VALUES (1, ?, ?, ?, ?, ?, ?, '1.0')
-
         conn = self.connect()
 
         # check if already initialized
@@ -206,14 +181,19 @@ class DatabaseManager:
         
         # Insert vault metadata
         created_at = datetime.now().isoformat()
+        kdf_json = json.dumps(kdf_config) if kdf_config else None
 
+        # FIXED: Explicitly mapping all columns to avoid parameter count mismatch
         conn.execute("""
             INSERT INTO vault_metadata (
-                id, salt, auth_hash, vault_key_encrypted, vault_key_nonce, vault_key_tag,
-                created_at, version
-            ) VALUES (1,?,?,?,?,?,?, '1.0')
+                id, salt, auth_hash, 
+                vault_key_encrypted, vault_key_nonce, vault_key_tag,
+                kdf_config,
+                created_at, version,
+                unlock_count, last_unlocked_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, '2.0', 0, NULL)
         """, (salt, auth_hash, vault_key_encrypted, vault_key_nonce,
-              vault_key_tag, created_at))
+              vault_key_tag, kdf_json, created_at))
         
         conn.commit()
         return True
@@ -322,7 +302,9 @@ class DatabaseManager:
             password: Optional[str] = None, 
             notes: Optional[str] = None, 
             tags: Optional[str] = None, 
-            category: str = "General"
+            category: str = "General",
+            favorite: bool = False,
+            password_strength: int = 0
     ) -> str:
         """ 
         Add new encrypted entry to vault
@@ -343,33 +325,6 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
-        # TODO: Implement entry creation with encryption
-        # HINTS:
-        # 1. Generate UUID for entry: entry_id = str(uuid.uuid4())
-        # 2. Derive entry-specific key from vault_key using HKDF:
-        # from cryptography.hazmat.primitives import hashes
-        # from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        # entry_key = HKDF(
-        #     algorithm=hashes.SHA256(),
-        #     length=32,
-        #     salt=None,
-        #     info=entry_id.encode()
-        # ).derive(vault_key)
-        # 3. Import crypto functions:
-        # from crypto_engine import encrypt_entry, generate_nonce
-        # 4. Prepare data dict: {"password": password, "notes": notes}
-        # 5. Encrypt data: ciphertext, nonce, tag = encrypt_entry(data, entry_key)
-        # 6. Get current timestamp: datetime.now().isoformat()
-        # 7. INSERT INTO entries with encrypted password and notes
-        # 8. Commit and return entry_id
-        # 
-        # SQL Example:
-        #     INSERT INTO entries (
-        #         id, title, url, username,
-        #         password_encrypted, password_nonce, password_tag,
-        #         notes_encrypted, notes_nonce, notes_tag,
-        #         tags, category, created_at, modified_at
-        #     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         try:
             # Validate inputs
             if not title or not isinstance(title, str):
@@ -384,16 +339,13 @@ class DatabaseManager:
             # Derive the entry key
             entry_key = self._derive_entry_key(vault_key, entry_id)
             
-            # Prepare the data
-            payload = {
-                "password": password or "",
-                "notes": notes or ""
-            }
-
-            payload_json = json.dumps(payload)
+            # 1. Encrypt Password
+            pw_payload = {"password": password or ""}
+            pw_cipher, pw_nonce, pw_tag = encrypt_entry(json.dumps(pw_payload), entry_key)
             
-            # Encrypt the data
-            ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+            # 2. Encrypt Notes
+            notes_payload = {"notes": notes or ""}
+            notes_cipher, notes_nonce, notes_tag = encrypt_entry(json.dumps(notes_payload), entry_key)
             
             # Timestamp
             now = datetime.now(timezone.utc).isoformat()
@@ -405,16 +357,17 @@ class DatabaseManager:
                     id, title, url, username,
                     password_encrypted, password_nonce, password_tag,
                     notes_encrypted, notes_nonce, notes_tag,
-                    tags, category, created_at, modified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tags, category, created_at, modified_at,
+                    favorite, password_strength, password_age_days
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, (
-                entry_id,
-                title, url, username,
-                ciphertext, nonce, tag,
-                ciphertext, nonce, tag,
-                tags, category, now, now
+                entry_id, title, url, username,
+                pw_cipher, pw_nonce, pw_tag,          
+                notes_cipher, notes_nonce, notes_tag, 
+                tags, category, now, now,
+                1 if favorite else 0,   
+                password_strength
             ))
-            
             conn.commit()
             return entry_id
             
@@ -455,23 +408,6 @@ class DatabaseManager:
         Raises:
             - DatabaseError: If decryption fails
         """
-         
-        # TODO: Implement entry retrieval with decryption
-        # HINTS:
-        # 1. Query: SELECT * FROM entries WHERE id = ? AND is_deleted = 0
-        # 2. If no row found, return None
-        # 3. Derive entry_key using same HKDF as add_entry()
-        # 4. Import: from crypto_engine import decrypt_entry
-        # 5. Decrypt password field:
-        #    decrypted_data = decrypt_entry(
-        #        row['password_encrypted'],
-        #        row['password_nonce'],
-        #        row['password_tag'],
-        #        entry_key
-        #    )
-        # 6. Update last_accessed_at timestamp
-        # 7. Return combined dict (metadata + decrypted fields)
-
         try:
             # Validate inputs
             if not entry_id or not isinstance(entry_id, str):
@@ -534,6 +470,9 @@ class DatabaseManager:
             except sqlite3.OperationalError as e:
                 warnings.warn(f"Failed to update last_accessed_at: {str(e)}")
             
+            modified_date = datetime.fromisoformat(row["modified_at"])
+            age_days = (datetime.now(timezone.utc) - modified_date).days
+
             # Return combined dict
             entry = {
                 "id": row["id"],
@@ -542,6 +481,9 @@ class DatabaseManager:
                 "username": row["username"],
                 "tags": row["tags"],
                 "category": row["category"],
+                "favorite": bool(row["favorite"]),          # <--- Return as bool
+                "password_strength": row["password_strength"], # <--- Return score
+                "password_age_days": age_days,
                 "created_at": row["created_at"],
                 "modified_at": row["modified_at"],
                 "last_accessed_at": now,
@@ -568,7 +510,9 @@ class DatabaseManager:
             password: Optional[str] = None,
             notes: Optional[str] = None, 
             tags: Optional[str] = None, 
-            category: Optional[str] = None
+            category: Optional[str] = None,
+            favorite: Optional[bool] = None,       
+            password_strength: Optional[int] = None
     )->bool:
         """ 
         Update existing entry (only provided fields)
@@ -585,20 +529,6 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
-        # TODO: Implement entry update
-        # HINTS:
-        # 1. Check if entry exists: SELECT id FROM entries WHERE id = ? AND is_deleted = 0
-        # 2. If not found, return False
-        # 3. Build UPDATE query dynamically for non-None fields
-        # 4. If password or notes changed, re-encrypt with same entry_key
-        # 5. Always update modified_at timestamp
-        # 6. Commit and return True
-        # 
-        # SQL Example:
-        #     UPDATE entries 
-        #     SET title = ?, url = ?, password_encrypted = ?, modified_at = ?
-        #     WHERE id = ?
-
         try:
             # Validate inputs
             if not entry_id or not isinstance(entry_id, str):
@@ -642,6 +572,14 @@ class DatabaseManager:
                 fields.append("category = ?")
                 values.append(category)
             
+            if favorite is not None:
+                fields.append("favorite = ?")
+                values.append(1 if favorite else 0)
+
+            if password_strength is not None:
+                fields.append("password_strength = ?")
+                values.append(password_strength)
+            
             # If password or notes changed, re-encrypt
             if password is not None or notes is not None:
                 entry_key = self._derive_entry_key(vault_key, entry_id)
@@ -652,6 +590,7 @@ class DatabaseManager:
                     ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
                     fields.extend(["password_encrypted = ?", "password_nonce = ?", "password_tag = ?"])
                     values.extend([ciphertext, nonce, tag])
+                    fields.append("password_age_days = 0")
                 
                 if notes is not None:
                     payload = {"notes": notes}
@@ -888,3 +827,58 @@ class DatabaseManager:
             return True
         except Exception:
             return False
+        
+    def get_audit_logs(self, limit: int = 50) -> List[Dict]:
+        """
+        Retrieve recent security audit logs.
+        Ordered by time (newest first) and ID (to handle same-second events).
+        """
+        conn = self.connect()
+        cursor = conn.execute("""
+            SELECT a.id, a.entry_id, e.title, a.action_type, a.timestamp
+            FROM audit_log a
+            LEFT JOIN entries e ON a.entry_id = e.id
+            ORDER BY a.timestamp DESC, a.id DESC  -- <--- FIXED: Added secondary sort
+            LIMIT ?
+        """, (limit,))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_old_entries(self, days_threshold: int = 90) -> List[Dict]:
+        """
+        Identify passwords older than X days for security auditing.
+        
+        Best Practice: 
+        Uses SQL date math on 'modified_at' to be 100% accurate,
+        bypassing the stale 'password_age_days' column.
+        """
+        try:
+            conn = self.connect()
+            
+            # SQL Logic: Find entries where 'modified_at' is older than threshold
+            # This is fast, accurate, and read-only.
+            cursor = conn.execute(f"""
+                SELECT id, title, username, modified_at, password_strength
+                FROM entries 
+                WHERE modified_at < datetime('now', '-{int(days_threshold)} days')
+                AND is_deleted = 0
+                ORDER BY modified_at ASC
+            """)
+            
+            results = []
+            for row in cursor.fetchall():
+                # Calculate exact age for display purposes
+                mod_date = datetime.fromisoformat(row["modified_at"])
+                age = (datetime.now(timezone.utc) - mod_date).days
+                
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "username": row["username"],
+                    "age_days": age,  # Real-time calculation
+                    "strength": row["password_strength"]
+                })
+            return results
+            
+        except Exception as e:
+            raise DatabaseError(f"Failed to fetch old entries: {e}")

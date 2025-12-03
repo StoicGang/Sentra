@@ -392,7 +392,6 @@ class SentraCLI:
         except Exception as e:
             print(f"Failed to lock vault: {e}")
 
-    # ---------- Interactive processing ----------
 
     def build_parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog=PROG, add_help=True)

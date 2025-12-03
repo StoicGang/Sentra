@@ -557,6 +557,99 @@ def test_entry_crud_roundtrip():
     
     print("CRUD roundtrip test passed!")
 
+def test_advanced_schema_fields():
+    """Test storage of favorite status and password strength"""
+    test_db = "data/test_vault_advanced.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    # Setup keys
+    salt = os.urandom(16)
+    db.save_vault_metadata(salt, os.urandom(32), os.urandom(32), os.urandom(12), os.urandom(16))
+    vault_key = os.urandom(32)
+
+    # 1. Add entry with Favorite=True and Strength=85
+    entry_id = db.add_entry(
+        vault_key=vault_key,
+        title="Important Login",
+        password="StrongPassword123!",
+        favorite=True,             # <--- New Field
+        password_strength=85       # <--- New Field
+    )
+
+    # 2. Retrieve and Verify
+    entry = db.get_entry(entry_id, vault_key)
+    assert entry['favorite'] is True, "Favorite should be boolean True"
+    assert entry['password_strength'] == 85, "Strength should be 85"
+
+    # 3. Update fields
+    db.update_entry(
+        entry_id, 
+        vault_key, 
+        favorite=False, 
+        password_strength=90
+    )
+
+    # 4. Verify Update
+    updated = db.get_entry(entry_id, vault_key)
+    assert updated['favorite'] is False
+    assert updated['password_strength'] == 90
+
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    print("Advanced schema fields test passed!")
+
+def test_audit_logging_triggers():
+    """Test that DB triggers automatically create audit logs"""
+    test_db = "data/test_vault_audit.db"
+    
+    if os.path.exists(test_db):
+        os.remove(test_db)
+    
+    db = DatabaseManager(test_db)
+    db.initialize_database()
+    
+    # Setup keys
+    db.save_vault_metadata(os.urandom(16), os.urandom(32), os.urandom(32), os.urandom(12), os.urandom(16))
+    vault_key = os.urandom(32)
+
+    # 1. CREATE Action
+    entry_id = db.add_entry(vault_key=vault_key, title="Audit Test")
+    
+    # Check logs
+    logs = db.get_audit_logs()
+    assert len(logs) > 0
+    assert logs[0]['action_type'] == 'CREATE'
+    assert logs[0]['entry_id'] == entry_id
+    assert logs[0]['title'] == "Audit Test"
+
+    # 2. UPDATE Action
+    db.update_entry(entry_id, vault_key, title="Audit Updated")
+    logs = db.get_audit_logs()
+    # Most recent log should be first
+    assert logs[0]['action_type'] == 'UPDATE'
+    assert logs[0]['title'] == "Audit Updated"
+
+    # 3. SOFT DELETE Action
+    db.delete_entry(entry_id)
+    logs = db.get_audit_logs()
+    assert logs[0]['action_type'] == 'SOFT_DELETE'
+
+    # 4. RESTORE Action
+    db.restore_entry(entry_id)
+    logs = db.get_audit_logs()
+    assert logs[0]['action_type'] == 'RESTORE'
+
+    db.close()
+    time.sleep(0.1)
+    os.remove(test_db)
+    print("Audit logging triggers test passed!")
+
 if __name__ == "__main__":
     test_database_connection()
     test_context_manager()
@@ -570,4 +663,6 @@ if __name__ == "__main__":
     test_delete_entry_soft_delete()
     test_restore_entry()
     test_entry_crud_roundtrip()
+    test_advanced_schema_fields() 
+    test_audit_logging_triggers()  
     print("\n ALL DATABASE TESTS PASSED!")

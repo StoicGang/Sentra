@@ -15,8 +15,10 @@ from src.crypto_engine import (
     generate_salt,
     encrypt_entry,
     decrypt_entry,
-    generate_key
+    generate_key,
+    verify_auth_hash
 )
+from src.password_generator import PasswordGenerator
 from src.database_manager import DatabaseError, DatabaseManager
 from src.secure_memory import SecureMemory
 
@@ -58,6 +60,9 @@ class VaultController:
         self.db = DatabaseManager(db_path)
         self.secure_mem = SecureMemory()
 
+        # Initialize Password Generator (MISSING IN YOUR CODE)
+        self.pw_gen = PasswordGenerator()
+
         # Adaptive lockout manager
         self.config = config or {}
         self.adaptive_lockout = AdaptiveLockout(self.db, self.config)
@@ -97,29 +102,6 @@ class VaultController:
             VaultError: If vault already unlocked or auth fails
             DatabaseError: If database operation fails
         """
-
-        # TODO: Implement vault unlock with hierarchical key derivation
-        # HINTS:
-        # 1. Check if already unlocked: raise VaultAlreadyUnlockedError
-        # 2. Initialize database: db.initialize_database() (ignore if already exists)
-        # 3. Load vault metadata: db.load_vault_metadata()
-        # 4. If no metadata, this is first unlock (new vault):
-        #    - Generate salt and auth_hash
-        #    - Derive master key from password
-        #    - Generate vault key
-        #    - Encrypt vault key with master key
-        #    - Save metadata to database
-        # 5. If metadata exists (existing vault):
-        #    - Generate salt from metadata
-        #    - Derive master key from password
-        #    - Verify password: compute_auth_hash(master_key) == metadata['auth_hash']
-        #    - Decrypt vault key: decrypt_entry(metadata['vault_key_encrypted'], ...)
-        # 6. Store keys in SecureMemory:
-        #    - Convert to bytearray for SecureMemory
-        #    - Lock memory to prevent swap
-        # 7. Set state: is_unlocked = True, unlock_timestamp = now
-        # 8. Update database: db.update_unlock_timestamp()
-        # 9. Return True
 
         if self.is_unlocked:
             raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.") 
@@ -171,6 +153,13 @@ class VaultController:
             vault_key = generate_key(32)
             vault_key_json = json.dumps({"vault_key": vault_key.hex()})
 
+            # ----------------------------------------------------------------
+            # DESIGN NOTE (Option B): Master-Key-Based Verification
+            # We derive the auth_hash from the master_key, not the password.
+            # This verifies the user possesses the correct master key.
+            # While non-standard, it is cryptographically consistent for local vaults.
+            # ----------------------------------------------------------------
+
             # Auth hash binds master key to fixed context for password verification
             master_key_b64 = base64.b64encode(master_key).decode('utf-8')
             auth_hash = compute_auth_hash(master_key_b64, salt)
@@ -188,7 +177,8 @@ class VaultController:
                 auth_hash=auth_hash,
                 vault_key_encrypted=ciphertext,
                 vault_key_nonce=nonce,
-                vault_key_tag=tag
+                vault_key_tag=tag,
+                kdf_config=kdf_params
             )
 
             if not saved:
@@ -196,9 +186,11 @@ class VaultController:
 
         else:
             # Existing vault - use stored parameters or defaults
-            stored_kdf = metadata.get("kdf", {})
-            if stored_kdf:
-                kdf_params = stored_kdf
+            if metadata.get("kdf_config"):
+                try:
+                    kdf_params = json.loads(metadata["kdf_config"])
+                except json.JSONDecodeError:
+                    warnings.warn("Corrupt KDF config in DB, using defaults.")
             
             salt = metadata["salt"]
 
@@ -211,10 +203,12 @@ class VaultController:
                 hash_len=kdf_params["hash_len"]
             )
 
-            # verify password
             master_key_b64 = base64.b64encode(master_key).decode('utf-8')
-            if compute_auth_hash(master_key_b64, salt=metadata["salt"]) != metadata["auth_hash"]:
+
+            # verify password
+            if not verify_auth_hash(metadata["auth_hash"], master_key_b64, salt):
                 self.adaptive_lockout.record_failure()
+                del master_key
                 raise VaultError("Invalid password")
             
             # On successful unlock:
@@ -238,12 +232,20 @@ class VaultController:
         try:
             self.master_key_secure = bytearray(master_key)
             self.vault_key_secure = bytearray(vault_key)
+
+            # Remove raw keys from Python stack immediately 
+            del master_key
+            del vault_key
+
             # Check if locking succeeded
+            # If we cannot lock RAM, we MUST NOT proceed.
             if not self.secure_mem.lock_memory(self.master_key_secure):
-                warnings.warn("Master key could not be locked in RAM (swapping possible)", RuntimeWarning)
+                self.secure_mem.zeroize(self.master_key_secure)
+                raise VaultError("CRITICAL: Failed to lock master key in memory. Operation aborted for security.")
                 
             if not self.secure_mem.lock_memory(self.vault_key_secure):
-                warnings.warn("Vault key could not be locked in RAM (swapping possible)", RuntimeWarning)
+                self.secure_mem.zeroize(self.vault_key_secure)
+                raise VaultError("CRITICAL: Failed to lock vault key in memory. Operation aborted for security.")
         except Exception as e:
             # Clean up on failure
             if self.master_key_secure:
@@ -256,6 +258,9 @@ class VaultController:
                     self.secure_mem.zeroize(self.vault_key_secure)
                 except:
                     pass
+            # Re-raise unless it's the specific lock error we just raised
+            if "CRITICAL" in str(e):
+                raise
             raise VaultError(f"Secure memory lock failed: {e}")
         
         self.is_unlocked = True
@@ -276,15 +281,6 @@ class VaultController:
         Returns:
             True if lock successful
         """
-        # TODO: Implement vault lock with secure cleanup
-        # HINTS:
-        # 1. If not unlocked, just return True (already locked)
-        # 2. Zeroize master key: secure_mem.zeroize(master_key_secure)
-        # 3. Zeroize vault key: secure_mem.zeroize(vault_key_secure)
-        # 4. Set to None: master_key_secure = None, vault_key_secure = None
-        # 5. Set state: is_unlocked = False
-        # 6. Close database connection: db.close()
-        # 7. Return True
         if not self.is_unlocked:
             # Already locked, nothing to do
             return True
@@ -315,6 +311,7 @@ class VaultController:
         url: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        favorite: bool = False,
         notes: Optional[str] = None,
         tags: Optional[str] = None,
         category: str = "General"
@@ -338,17 +335,17 @@ class VaultController:
             VaultLockedError: If vault locked
             VaultError: If add fails
         """
-        # TODO: Implement add_password with unlock check
         self._check_unlocked()  # Raise if locked
 
         try:
-            # Validate required fields
-            if not title or not isinstance(title, str):
-                raise ValueError("Entry title must be a non-empty string")
+            # Auto-calculate strength if password is provided
+            strength_score = 0
+            if password:
+                score, label, _ = self.pw_gen.calculate_strength(password)
+                strength_score = score
 
             vault_key = bytes(self.vault_key_secure)
 
-            # add entry
             entry_id = self.db.add_entry(
                 vault_key=vault_key, 
                 title=title,
@@ -357,7 +354,9 @@ class VaultController:
                 password=password, 
                 notes=notes,
                 tags=tags,
-                category=category
+                category=category,
+                favorite=favorite,             # <--- Pass to DB
+                password_strength=strength_score # <--- Pass to DB
             )        
             return entry_id
         
@@ -378,7 +377,6 @@ class VaultController:
             VaultLockedError: If vault locked
             VaultError: If retrieval fails
         """
-        # TODO: Implement get_password with unlock check
         self._check_unlocked() 
 
         try:
@@ -415,7 +413,6 @@ class VaultController:
         - Returns non-sensitive metadata only.
         
         """
-        # TODO: Implement search_entries with unlock check
 
         self._check_unlocked()
 
@@ -423,17 +420,39 @@ class VaultController:
             conn = self.db.connect()
             search_query = f"{query.strip()}"
             
-            sql = """
-                SELECT e.id, e.title, e.url, e.username, e.tags, e.category, e.created_at, e.modified_at, e.is_deleted
-                FROM entries e
-                JOIN entries_fts ON e.rowid = entries_fts.rowid      
-                WHERE entries_fts MATCH ?
-            """
-
-            params = [search_query] 
-            
-            if not include_deleted:
-                sql += " AND e.is_deleted = 0"
+            if include_deleted:
+                # STRATEGY 2: Recovery Mode (Bypass FTS)
+                # Since schema triggers remove deleted items from the FTS index,
+                # we must scan the 'entries' table directly to find them.
+                sql = """
+                    SELECT id, title, url, username, tags, category, 
+                           created_at, modified_at, is_deleted
+                    FROM entries
+                    WHERE (
+                        title LIKE ? OR 
+                        url LIKE ? OR 
+                        username LIKE ? OR 
+                        tags LIKE ?
+                    )
+                """
+                # Add wildcards for substring matching
+                wildcard = f"%{search_query}%"
+                params = [wildcard, wildcard, wildcard, wildcard]
+                
+            else:
+                # STRATEGY 1: Secure Speed Mode (FTS Index)
+                # Only searches what is in the index (Active items only).
+                # Note: We wrap the query in double quotes for phrase matching logic
+                sql = """
+                    SELECT e.id, e.title, e.url, e.username, e.tags, e.category, 
+                           e.created_at, e.modified_at, e.is_deleted
+                    FROM entries e
+                    JOIN entries_fts ON e.rowid = entries_fts.rowid      
+                    WHERE entries_fts MATCH ?
+                """
+                # FTS5 syntax: append * for prefix matching (e.g., "amaz" -> amazon)
+                fts_query = f'"{search_query}" *' 
+                params = [fts_query]
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
@@ -443,3 +462,13 @@ class VaultController:
         
         except Exception as e:
             raise VaultError(f"Failed to search entries: {e}")
+    
+    def view_audit_log(self) -> List[Dict]:
+        """
+        View the security audit trail of the vault.
+        """
+        self._check_unlocked()
+        try:
+            return self.db.get_audit_logs()
+        except Exception as e:
+            raise VaultError(f"Failed to retrieve audit log: {e}")
