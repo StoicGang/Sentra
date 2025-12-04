@@ -348,21 +348,14 @@ def encrypt_entry(
         >>> len(auth_tag)
         16  
     """
-    # TODO: Implement ChaCha20-Poly1305 encryption
-    # HINTS:
-    # 1. Generate unique nonce using generate_nonce()
-    # 2. Create ChaCha20Poly1305(key) cipher object
-    # 3. Encode plaintext to UTF-8 bytes
-    # 4. Call cipher.encrypt(nonce, plaintext_bytes, associated_data)
-    # 5. Split returned ciphertext_with_tag into ciphertext and auth_tag
-    #    (auth_tag is last 16 bytes)
-    # 6. Return tuple (ciphertext, nonce, auth_tag)
-
     try:
+        if associated_data is None: associated_data = b""
         nonce = generate_nonce(12)
         cipher = ChaCha20Poly1305(key)
         plaintext_bytes = plaintext.encode('utf-8')
         cipher_with_tag = cipher.encrypt(nonce, plaintext_bytes, associated_data)
+        # ChaCha20-Poly1305 returns ciphertext + 16-byte tag appended at the end
+        # so we split the last 16 bytes as the tag
         ciphertext = cipher_with_tag[:-16]
         auth_tag = cipher_with_tag[-16:]
         return ciphertext, nonce, auth_tag
@@ -403,15 +396,9 @@ def decrypt_entry(
         >>> json.loads(plaintext)
         {'url': 'https://example.com', 'password': 'secret'}
     """
-    # TODO: Implement ChaCha20-Poly1305 decryption
-    # HINTS:
-    # 1. Create ChaCha20Poly1305(key) cipher object
-    # 2. Reconstruct ciphertext_with_tag = ciphertext + auth_tag
-    # 3. Call cipher.decrypt(nonce, ciphertext_with_tag, associated_data)
-    # 4. Decode returned bytes to UTF-8 string
-    # 5. On InvalidTag exception, re-raise with clear message
     
     try:
+        if associated_data is None: associated_data = b""
         cipher = ChaCha20Poly1305(key)
         ciphertext_with_tag = ciphertext + auth_tag
         plaintext_bytes = cipher.decrypt(nonce, ciphertext_with_tag, associated_data)
@@ -454,6 +441,12 @@ def compute_hmac(data: bytes, key: bytes, algorithm: str = 'sha256') -> bytes:
         >>> compute_hmac(tampered_data, key) == hmac_tag
         False
     """
+    if isinstance(key, bytearray):
+        key = bytes(key)
+    
+    if isinstance(data, bytearray):
+        data = bytes(data)
+
     h = hmac.new(key, data, hashlib.sha256)
 
     return h.digest()

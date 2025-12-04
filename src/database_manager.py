@@ -11,6 +11,7 @@ from pathlib import Path
 import warnings
 import json
 import uuid
+from src.config import DB_PATH, SCHEMA_PATH
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from src.crypto_engine import encrypt_entry, decrypt_entry, derive_master_key, generate_salt, generate_nonce, compute_auth_hash, compute_hmac
@@ -43,7 +44,7 @@ class DatabaseManager:
         - Supports soft delete (trash system) for recovery
     """
 
-    def __init__(self, db_path: str = "data/vault.db"):
+    def __init__(self, db_path: str = DB_PATH):
         """
         Initialize database manager
         
@@ -98,6 +99,27 @@ class DatabaseManager:
         """Context manager exit - auto-close"""
         self.close()
 
+    def get_all_entries(self, vault_key: bytes) -> List[Dict]:
+        """
+        Retrieve and decrypt ALL entries (used for backups).
+        """
+        try:
+            conn = self.connect()
+            # Get all active IDs
+            cursor = conn.execute("SELECT id FROM entries WHERE is_deleted = 0")
+            rows = cursor.fetchall()
+            
+            all_entries = []
+            for row in rows:
+                # Reuse get_entry to handle key derivation and decryption safely
+                entry = self.get_entry(row["id"], vault_key)
+                if entry:
+                    all_entries.append(entry)
+            
+            return all_entries
+        except Exception as e:
+            raise DatabaseError(f"Failed to retrieve all entries: {e}")
+
     def initialize_database(self) -> bool:
         """
         Initialize database shema from schema.sql file
@@ -113,16 +135,6 @@ class DatabaseManager:
             - FileNotFoundError: schema.sql not found
             - sqlite3.Error: SQL execution failed
         """
-        # TODO: Implement database initialization
-        # HINTS:
-        # 1. Check if database already initialized:
-        #    - Query: SELECT name FROM sqlite_master WHERE type='table' AND name='vault_metadata'
-        #    - If exists, return False (already initialized)
-        # 2. Read schema.sql file from data/schema.sql
-        # 3. Execute schema SQL: connection.executescript(schema_sql)
-        # 4. Commit transaction: connection.commit()
-        # 5. Return True
-
         conn = self.connect()
 
         # check if already initialized
@@ -133,18 +145,18 @@ class DatabaseManager:
             return False  # Already initialized
         
         # Read schema file
-        schema_path = "data/schema.sql"
-        if not os.path.exists(schema_path):
-            raise DatabaseError(f"Schema file not found: {schema_path}")
-        
-        with open(schema_path, 'r') as f:
-            schema_sql = f.read()
+        try:
+            with open(SCHEMA_PATH, 'r') as f:
+                schema_sql = f.read()
 
-        # Execute schema
-        conn.executescript(schema_sql)
-        conn.commit()
-
-        return True
+            # Execute schema
+            conn.executescript(schema_sql)
+            conn.commit()
+            return True
+        except IOError as e:
+            raise DatabaseError(f"Failed to read schema file: {e}")
+        except sqlite3.Error as e:
+            raise DatabaseError(f"SQL execution failed: {e}")
     
     def save_vault_metadata(
             self,
@@ -304,7 +316,8 @@ class DatabaseManager:
             tags: Optional[str] = None, 
             category: str = "General",
             favorite: bool = False,
-            password_strength: int = 0
+            password_strength: int = 0,
+            entry_id: Optional[str] = None
     ) -> str:
         """ 
         Add new encrypted entry to vault
@@ -334,7 +347,8 @@ class DatabaseManager:
                 raise ValueError("Vault key must be 32 bytes")
             
             # Generate the UUID
-            entry_id = str(uuid.uuid4())
+            if entry_id is None:
+                entry_id = str(uuid.uuid4())
             
             # Derive the entry key
             entry_key = self._derive_entry_key(vault_key, entry_id)
@@ -642,11 +656,6 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
-        # TODO: Implement soft delete
-        # HINTS:
-        # 1. UPDATE entries SET is_deleted = 1, deleted_at = ? WHERE id = ?
-        # 2. Check cursor.rowcount > 0 to verify row was updated
-        # 3. Commit and return result
         try:
             # Validate input
             if not entry_id or not isinstance(entry_id, str):
@@ -722,20 +731,15 @@ class DatabaseManager:
     def restore_entry(self, entry_id: str) -> bool:
         """
         Restore soft-deleted entry from trash
-        
+        Trigger 'entries_au' automatically handles FTS re-indexing and Audit Log.
+
         Args:
             - entry_id: Entry UUID
         
         Returns:
             - True if restored successfully
             - False if entry not found in trash
-        """
-        # TODO: Implement entry restoration
-        # HINTS:
-        # 1. UPDATE entries SET is_deleted = 0, deleted_at = NULL WHERE id = ? AND is_deleted = 1
-        # 2. Check cursor.rowcount > 0
-        # 3. Commit and return result
-        
+        """ 
         try:
             # Validate input
             if not entry_id or not isinstance(entry_id, str):
@@ -746,8 +750,8 @@ class DatabaseManager:
             now = datetime.now(timezone.utc).isoformat()
             
             cursor = conn.execute(
-                "UPDATE entries SET is_deleted = 0, deleted_at = NULL, modified_at = ? WHERE id = ? AND is_deleted = 1",
-                (now, entry_id)
+                "UPDATE entries SET is_deleted = 0, deleted_at = NULL WHERE id = ? AND is_deleted = 1",
+                (entry_id,)
             )
             
             if cursor.rowcount > 0:
@@ -762,38 +766,7 @@ class DatabaseManager:
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
             raise DatabaseError(f"Unexpected error restoring entry: {str(e)}")
-        
-    def mark_entry_deleted(self, entry_id: str) -> None:
-        """
-        Mark an entry as soft-deleted in the database by setting its is_deleted flag.
-        
-        Args:
-            entry_id: The UUID of the entry to soft-delete.
-            
-        Raises:
-            DatabaseError: If update fails.
-        """
-        try:
-            # Use Python datetime to match the format used in add_entry/update_entry
-            deleted_at = datetime.now(timezone.utc).isoformat()
-            
-            # Corrected column names: isdeleted -> is_deleted, deletedat -> deleted_at
-            # Removed autodeleteat as it likely doesn't exist in your schema based on other methods
-            sql = """
-            UPDATE entries
-            SET is_deleted = 1,
-                deleted_at = ?
-            WHERE id = ?
-            """
-            
-            # Ensure connection is open
-            conn = self.connect()
-            conn.execute(sql, (deleted_at, entry_id))
-            conn.commit()
-            
-        except Exception as e:
-            raise DatabaseError(f"Failed to mark entry as deleted: {e}")
-        
+
     def get_metadata(self, key: str) -> Optional[str]:
         """
         Retrieve metadata value or None if not found.
@@ -882,3 +855,89 @@ class DatabaseManager:
             
         except Exception as e:
             raise DatabaseError(f"Failed to fetch old entries: {e}")
+        
+    def search_entries(
+        self,
+        query: str,
+        include_deleted: bool = False
+    ) -> List[Dict]:
+        """
+        Search entries by title/URL/tags
+        
+        Args:
+            query: Search query
+            include_deleted: Include soft-deleted entries
+        
+        Returns:
+            List of matching entries (metadata only, not decrypted)
+        
+        Raises:
+            VaultLockedError: If vault locked
+            VaultError: If search fails
+
+        Security:
+        - Ensures vault unlocked before access.
+        - Uses parameterized queries to prevent SQL injection.
+        - Returns non-sensitive metadata only.
+        
+        """
+        try:
+            conn = self.connect()
+            search_query = f"{query.strip()}"
+            
+            if include_deleted:
+                # STRATEGY 2: Recovery Mode (Bypass FTS) -> Uses LIKE
+                safe = search_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                wildcard = f"%{safe}%"
+                # Since schema triggers remove deleted items from the FTS index,
+                # we must scan the 'entries' table directly to find them.
+                sql = """
+                    SELECT id, title, url, username, tags, category, 
+                        created_at, modified_at, is_deleted
+                    FROM entries
+                    WHERE (
+                        title LIKE ? ESCAPE '\\' OR 
+                        url LIKE ? ESCAPE '\\' OR 
+                        username LIKE ? ESCAPE '\\' OR 
+                        tags LIKE ? ESCAPE '\\'
+                    )
+                """
+                # Add wildcards for substring matching
+                params = [wildcard, wildcard, wildcard, wildcard]
+                
+            else:
+                # STRATEGY 1: Secure Speed Mode (FTS Index)
+                # Robust FTS: Split terms to allow "foo bar" to match "foo...bar" or "bar...foo"
+                # rather than enforcing an exact phrase match of "foo bar".
+                
+                terms = search_query.split()
+                
+                if not terms:
+                    return []
+
+                # 1. Sanitize: Escape double quotes inside terms (standard SQL escaping)
+                # 2. Tokenize: Wrap each term in quotes and append * for prefix matching
+                #    Input:  foo "bar
+                #    Output: "foo"* """bar"*
+                safe_terms = [f'"{t.replace("\"", "\"\"")}"*' for t in terms]
+                
+                # 3. Join: Space implies implicit AND in FTS5
+                fts_query = " ".join(safe_terms)
+                
+                sql = """
+                    SELECT e.id, e.title, e.url, e.username, e.tags, e.category, 
+                        e.created_at, e.modified_at, e.is_deleted
+                    FROM entries e
+                    JOIN entries_fts ON e.rowid = entries_fts.rowid      
+                    WHERE entries_fts MATCH ?
+                """
+                params = [fts_query]
+
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+
+            results = [dict(row) for row in rows]
+            return results
+        
+        except Exception as e:
+            raise DatabaseError(f"Failed to search entries: {e}")

@@ -39,7 +39,6 @@ class TestRandomGeneration:
         key = generate_key()
         assert len(key) == 32, "Key should be 32 bytes"
 
-
 class TestKeyDerivation:
     """Test Argon2id and PBKDF2 functions"""
     
@@ -75,36 +74,57 @@ class TestKeyDerivation:
         wrong_hash = compute_auth_hash("WrongPassword", salt)
         assert auth_hash != wrong_hash, "Different passwords should produce different hashes"
 
-
 class TestEncryption:
     """Test ChaCha20-Poly1305 AEAD encryption"""
+
+    def setup_method(self):
+        self.password = "MasterPassword123!"
+        self.salt = generate_salt()
+        self.key = derive_master_key(self.password, self.salt, time_cost=1, memory_cost=8192)
     
     def test_encrypt_decrypt_roundtrip(self):
-        """Test encryption and decryption round-trip"""
-        test_entry = {
-            "url": "https://github.com",
-            "username": "test@example.com",
-            "password": "SecurePass123!",
-            "notes": "Test account"
-        }
+        """Test encryption and decryption round-trip (no AAD)"""
+        test_entry = {"url": "https://github.com", "password": "SecurePass123!"}
         plaintext = json.dumps(test_entry)
         
-        password = "MasterPassword123!"
-        salt = generate_salt()
-        key = derive_master_key(password, salt, time_cost=2, memory_cost=32768)
-        
         # Encrypt
-        ciphertext, nonce, auth_tag = encrypt_entry(plaintext, key)
+        ciphertext, nonce, auth_tag = encrypt_entry(plaintext, self.key)
         
-        assert len(nonce) == 12, "Nonce should be 12 bytes"
-        assert len(auth_tag) == 16, "Auth tag should be 16 bytes"
-        assert len(ciphertext) > 0, "Ciphertext should not be empty"
+        assert len(nonce) == 12
+        assert len(auth_tag) == 16
         
         # Decrypt
-        decrypted = decrypt_entry(ciphertext, nonce, auth_tag, key)
-        
-        assert decrypted == plaintext, "Decrypted text should match original"
-        assert json.loads(decrypted) == test_entry, "Decrypted JSON should match original"
+        decrypted = decrypt_entry(ciphertext, nonce, auth_tag, self.key)
+        assert decrypted == plaintext
+
+    def test_encrypt_decrypt_with_aad(self):
+        """Test encryption with Associated Data (Context Binding)"""
+        plaintext = "Sensitive Data"
+        context = b"entry-uuid-1234"
+
+        # Encrypt with Context
+        ciphertext, nonce, tag = encrypt_entry(plaintext, self.key, associated_data=context)
+
+        # Decrypt with SAME Context -> Success
+        decrypted = decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=context)
+        assert decrypted == plaintext
+
+    def test_aad_mismatch_detection(self):
+        """Test that decryption fails if AAD context does not match"""
+        plaintext = "Sensitive Data"
+        context = b"correct-context"
+        wrong_context = b"wrong-context"
+
+        # Encrypt
+        ciphertext, nonce, tag = encrypt_entry(plaintext, self.key, associated_data=context)
+
+        # Decrypt with WRONG Context -> Fail
+        with pytest.raises(InvalidTag):
+            decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=wrong_context)
+
+        # Decrypt with NO Context -> Fail
+        with pytest.raises(InvalidTag):
+            decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=None)
     
     def test_tampering_detection(self):
         """Test that tampering is detected"""
@@ -124,7 +144,6 @@ class TestEncryption:
         # Should raise InvalidTag
         with pytest.raises(InvalidTag):
             decrypt_entry(tampered, nonce, auth_tag, key)
-
 
 class TestHMAC:
     """Test HMAC integrity functions"""
@@ -152,7 +171,6 @@ class TestHMAC:
         tampered_hmac = compute_hmac(tampered_data, key)
         
         assert original_hmac != tampered_hmac, "HMAC should differ for different data"
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

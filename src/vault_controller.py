@@ -86,7 +86,6 @@ class VaultController:
         """
         if not self.is_unlocked:
             raise VaultLockedError("Vault is locked. Call unlock_vault() first.")
-        
 
     def unlock_vault(self, password: str) -> bool:
         """ 
@@ -153,16 +152,8 @@ class VaultController:
             vault_key = generate_key(32)
             vault_key_json = json.dumps({"vault_key": vault_key.hex()})
 
-            # ----------------------------------------------------------------
-            # DESIGN NOTE (Option B): Master-Key-Based Verification
-            # We derive the auth_hash from the master_key, not the password.
-            # This verifies the user possesses the correct master key.
-            # While non-standard, it is cryptographically consistent for local vaults.
-            # ----------------------------------------------------------------
-
-            # Auth hash binds master key to fixed context for password verification
-            master_key_b64 = base64.b64encode(master_key).decode('utf-8')
-            auth_hash = compute_auth_hash(master_key_b64, salt)
+            # Auth hash binds password to fixed context for password verification
+            auth_hash = compute_auth_hash(password, salt)
 
             # AEAD encrypt vault key under master key; store nonce + ciphertext + tag
             ciphertext, nonce, tag = encrypt_entry(
@@ -194,6 +185,15 @@ class VaultController:
             
             salt = metadata["salt"]
 
+            # verify password
+            if not verify_auth_hash(metadata["auth_hash"], password, salt):
+                self.adaptive_lockout.record_failure()
+                raise VaultError("Invalid password")
+            
+            # On successful unlock:
+            self.adaptive_lockout.reset_session()   
+
+            # Derive Master Key only after auth succeeds
             master_key = derive_master_key(
                 password=password,
                 salt=salt, 
@@ -202,17 +202,6 @@ class VaultController:
                 parallelism=kdf_params["parallelism"],
                 hash_len=kdf_params["hash_len"]
             )
-
-            master_key_b64 = base64.b64encode(master_key).decode('utf-8')
-
-            # verify password
-            if not verify_auth_hash(metadata["auth_hash"], master_key_b64, salt):
-                self.adaptive_lockout.record_failure()
-                del master_key
-                raise VaultError("Invalid password")
-            
-            # On successful unlock:
-            self.adaptive_lockout.reset_session()   
             
             # Decrypt vault key 
             try:
@@ -386,80 +375,16 @@ class VaultController:
             return entry
         except Exception as e:
             raise VaultError(f"Failed to retrieve password entry: {e}")
-        
-    
-    def search_entries(
-        self,
-        query: str,
-        include_deleted: bool = False
-    ) -> List[Dict]:
-        """
-        Search entries by title/URL/tags
-        
-        Args:
-            query: Search query
-            include_deleted: Include soft-deleted entries
-        
-        Returns:
-            List of matching entries (metadata only, not decrypted)
-        
-        Raises:
-            VaultLockedError: If vault locked
-            VaultError: If search fails
 
-        Security:
-        - Ensures vault unlocked before access.
-        - Uses parameterized queries to prevent SQL injection.
-        - Returns non-sensitive metadata only.
-        
+    def search_entries(self, query: str, include_deleted: bool = False) -> List[Dict]:
         """
-
+        Search entries by title/URL/tags.
+        Delegates to DatabaseManager.search_entries.
+        """
         self._check_unlocked()
 
         try:
-            conn = self.db.connect()
-            search_query = f"{query.strip()}"
-            
-            if include_deleted:
-                # STRATEGY 2: Recovery Mode (Bypass FTS)
-                # Since schema triggers remove deleted items from the FTS index,
-                # we must scan the 'entries' table directly to find them.
-                sql = """
-                    SELECT id, title, url, username, tags, category, 
-                           created_at, modified_at, is_deleted
-                    FROM entries
-                    WHERE (
-                        title LIKE ? OR 
-                        url LIKE ? OR 
-                        username LIKE ? OR 
-                        tags LIKE ?
-                    )
-                """
-                # Add wildcards for substring matching
-                wildcard = f"%{search_query}%"
-                params = [wildcard, wildcard, wildcard, wildcard]
-                
-            else:
-                # STRATEGY 1: Secure Speed Mode (FTS Index)
-                # Only searches what is in the index (Active items only).
-                # Note: We wrap the query in double quotes for phrase matching logic
-                sql = """
-                    SELECT e.id, e.title, e.url, e.username, e.tags, e.category, 
-                           e.created_at, e.modified_at, e.is_deleted
-                    FROM entries e
-                    JOIN entries_fts ON e.rowid = entries_fts.rowid      
-                    WHERE entries_fts MATCH ?
-                """
-                # FTS5 syntax: append * for prefix matching (e.g., "amaz" -> amazon)
-                fts_query = f'"{search_query}" *' 
-                params = [fts_query]
-
-            cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-
-            results = [dict(row) for row in rows]
-            return results
-        
+            return self.db.search_entries(query, include_deleted)
         except Exception as e:
             raise VaultError(f"Failed to search entries: {e}")
     
@@ -472,3 +397,58 @@ class VaultController:
             return self.db.get_audit_logs()
         except Exception as e:
             raise VaultError(f"Failed to retrieve audit log: {e}")
+
+    def list_entries(self, include_deleted: bool = False) -> List[Dict]:
+        """
+        List all entries (metadata only).
+        Delegates to DatabaseManager.list_entries.
+        """
+        self._check_unlocked()
+        try:
+            return self.db.list_entries(include_deleted=include_deleted)
+        except Exception as e:
+            raise VaultError(f"Failed to list entries: {e}")
+
+    def update_entry(self, entry_id: str, **kwargs) -> bool:
+        """
+        Update an existing entry.
+        
+        Handles:
+        - Security check (is_unlocked)
+        - Key management (retrieves secure key for DB)
+        - Password strength recalculation (if password changes)
+        """
+        self._check_unlocked()
+        try:
+            vault_key = bytes(self.vault_key_secure)
+            
+            # If password is being updated, automatically recalculate strength
+            if "password" in kwargs and kwargs["password"]:
+                score, _, _ = self.pw_gen.calculate_strength(kwargs["password"])
+                kwargs["password_strength"] = score
+            
+            return self.db.update_entry(entry_id, vault_key, **kwargs)
+        except Exception as e:
+            raise VaultError(f"Failed to update entry: {e}")
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """
+        Soft-delete an entry.
+        Delegates to DatabaseManager.delete_entry.
+        """
+        self._check_unlocked()
+        try:
+            return self.db.delete_entry(entry_id)
+        except Exception as e:
+            raise VaultError(f"Failed to delete entry: {e}")
+
+    def restore_entry(self, entry_id: str) -> bool:
+        """
+        Restore a deleted entry from trash.
+        Delegates to DatabaseManager.restore_entry.
+        """
+        self._check_unlocked()
+        try:
+            return self.db.restore_entry(entry_id)
+        except Exception as e:
+            raise VaultError(f"Failed to restore entry: {e}")

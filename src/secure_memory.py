@@ -13,6 +13,7 @@ import sys
 import ctypes
 import warnings
 from typing import Optional, Tuple
+from datetime import datetime, timezone
 import atexit
 
 # Platform detection constants
@@ -171,48 +172,38 @@ class SecureMemory:
             >>> if not success:
             ....    print("Running in degraded mode - no mlock protection")    
         """
-
-        # TODO: Implement memory locking
-        # HINTS:
-        # 1. Get memory address of data using id() and ctypes.addressof()
-        # 2. Get data length using len(data)
-        # 3. Call appropriate platform function (mlock on unix, VirtualLock on Windows)
-        # 4. Check return value:
-        #   - Unix: mlock returns 0 on success, -1 on failure
-        #   - Windows: VirtualLock returns True on success, False on failure
-        # 5. If failed, issue warning with get_last_error_message()
-        # 6. Track region in self.locked_regions even if degraded
-        # 7. Return True if locked, False if degraded
-
         try:
             addr, length, keeper = self._address_and_length(data)
         except Exception as e:
             warnings.warn(f"SecureMemory: unable to get buffer address: {e}")
             self.locked_regions.append({
-                "addr": None, "length":len(data) if hasattr(data, "__len__") else None,
-                "locked": False, "platform": sys.platform
+                "addr": None, 
+                "length": len(data) if hasattr(data, "__len__") else None,
+                "locked": False, 
+                "platform": sys.platform,
+                "locked_at": datetime.now(timezone.utc).isoformat()  # <--- Added
             })
             return False
         
         if length == 0:
-            # Nothing to lock : success
             self.locked_regions.append({
-                "addr":addr, "length":0, "locked": True, "platform": sys.platform
+                "addr": addr, 
+                "length": 0, 
+                "locked": True, 
+                "platform": sys.platform,
+                "locked_at": datetime.now(timezone.utc).isoformat()  # <--- Added
             })
             return True
         
         locked_ok = False
 
         if IS_WINDOWS and self.kernel32 is not None:
-            # Vituallock returns nonzero Bool on success
             ok = bool(self.kernel32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
             locked_ok = ok
         elif (IS_LINUX or IS_MACOS) and self.libc is not None and hasattr(self.libc, "mlock"):
-            # mlock returns 0 on success, -1 on failure
             rc = int(self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
             locked_ok = (rc == 0)
         else:
-            # Unsupported platform or missing symbols
             warnings.warn(
                 "SecureMemory: locking not supported on this platform; running on degraded mode. "
             )
@@ -225,8 +216,12 @@ class SecureMemory:
             setattr(self, f"_keeper_{id(data)}", keeper)
 
         self.locked_regions.append({
-            "addr": addr, "length": length, "locked": bool(locked_ok), "id": id(data),
-            "platform": ("Windows" if IS_WINDOWS else "unix" if (IS_LINUX or IS_MACOS) else sys.platform)
+            "addr": addr, 
+            "length": length, 
+            "locked": bool(locked_ok), 
+            "id": id(data),
+            "platform": ("Windows" if IS_WINDOWS else "unix" if (IS_LINUX or IS_MACOS) else sys.platform),
+            "locked_at": datetime.now(timezone.utc).isoformat()  # <--- Added
         })
 
         return bool(locked_ok)
@@ -307,17 +302,6 @@ class SecureMemory:
         Example:
             >>> sm.unlock_memory(key)
         """
-
-        # TODO: Implement memory unlocking
-        # HINTS:
-        # 1. Get memory address using id() and ctypes.addressof()
-        # 2. Get data length using len(data)
-        # 3. Call appropriate platform function (munlock on Unix, VirtualUnlock on Windows)
-        # 4. Check return value (same as lock_memory)
-        # 5. Remove region from self.locked_regions
-        # 6. Handle cases where region not found (silently ignore)
-        # 7. Return True if successful
-
         try:
             addr, length, keeper = self._address_and_length(data)
         except Exception as e:
@@ -350,26 +334,37 @@ class SecureMemory:
         else:
             warnings.warn("SecureMemory: unlocking not supported on the platform: degraded mode")
             unlocked_ok = False
-
-        if unlocked_ok:
-            for region in self.locked_regions:
-                # Find the record matching this ID
-                if region.get('id') == id(data):
-                    region['locked'] = False # Mark as unlocked so cleanup_all skips it
-
+        
         if not unlocked_ok:
-            warnings.warn(f"SecureMemory: memory unlock failed")
-
+            # FIX: Get the detailed platform-specific error message
+            msg = self._get_last_error_message()
+            warnings.warn(f"SecureMemory: unlock failed: {msg}")
+            return False
+        
         keeper_name = f"_keeper_{id(data)}"
         if hasattr(self, keeper_name):
             delattr(self, keeper_name)
+        
+        # FIX: Update existing record instead of appending duplicates
+        found = False
+        now_ts = datetime.now(timezone.utc).isoformat()
+        for region in self.locked_regions:
+            if region.get('id') == id(data):
+                region['locked'] = False
+                region['unlocked_at'] = now_ts
+                found = True
+                break
+        
+        # Only append if we somehow lost track of this region (defensive programming)
+        if not found:
+            self.locked_regions.append({
+                "addr": addr, "length": length, "locked": False,
+                "id": id(data),
+                "platform": ("Windows" if IS_WINDOWS else "unix" if (IS_LINUX or IS_MACOS) else sys.platform),
+                "unlocked_at": now_ts
+            })
 
-        self.locked_regions.append({
-            "addr": addr, "length": length, "locked": False,
-            "platform": ("windows" if IS_WINDOWS else "unix" if (IS_LINUX or IS_MACOS) else sys.platform)
-        })
-
-        return bool(unlocked_ok)
+        return True
     
     def _get_last_error_message(self) -> str:
         """
