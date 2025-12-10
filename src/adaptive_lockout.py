@@ -5,9 +5,11 @@ Handles adaptive brute-force protection with dynamic delays and historical track
 
 import json
 import time
+from src.database_manager import DatabaseManager
+from typing import Dict, Any, Tuple
 
 class AdaptiveLockout:
-    def __init__(self, dbmanager, config):
+    def __init__(self, dbmanager: DatabaseManager, config: Dict[str, Any]):
         """
         Initialize adaptive lockout manager
         
@@ -19,14 +21,6 @@ class AdaptiveLockout:
         """
         self.dbmanager = dbmanager
         self.config = config
-        self.current_session_attempts = 0
-        self.last_attempt_time = None
-        
-        history_json = self.dbmanager.get_metadata("failed_attempts_history")
-        if history_json:
-            self.failed_attempt_history = json.loads(history_json)
-        else:
-            self.failed_attempt_history = []
 
     def record_failure(self):
         """
@@ -38,50 +32,46 @@ class AdaptiveLockout:
         - Trim failed_attempt_history to last 100 entries.
         - Save updated history JSON to database metadata.
         """
-        self.current_session_attempts += 1
-        current_time = int(time.time())
-        self.failed_attempt_history.append(current_time)
-        
-        # Keep only the last 100 failed attempts
-        if len(self.failed_attempt_history) > 100:
-            self.failed_attempt_history = self.failed_attempt_history[-100:]
-        
-        history_json = json.dumps(self.failed_attempt_history)
-        self.dbmanager.update_metadata("failed_attempts_history", history_json)
+        self.dbmanager.record_lockout_failure()
 
-    def check_and_delay(self) -> tuple[bool, int]:
+    def check_and_delay(self) -> Tuple[bool, int]:
         """
-        Check if a new unlock attempt is allowed and return delay in seconds.
-        
-        Returns:
-            allowed (bool): True if attempt allowed
-            delay_seconds (int): Required delay before next attempt (0 if allowed)
+        Determine whether a new unlock attempt is allowed.
+        Uses sliding-window adaptive delay based on recent failures.
         """
-        max_delay = self.config.get("max_lockout_delay", 300)  # default 5 minutes
+        max_delay = int(self.config.get("max_lockout_delay", 300))  # seconds
+        lookback_window = int(self.config.get("history_window_seconds", 1800))  # default: 30 minutes
+
         now = int(time.time())
-        
-        # If no failed attempts, allow immediately
-        if not self.failed_attempt_history:
+        cutoff = now - lookback_window
+
+        # Fetch only recent attempts
+        timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+        count = len(timestamps)
+
+        if count == 0:
             return True, 0
-        
-        last_attempt = self.failed_attempt_history[-1]
+
+        last_attempt = timestamps[-1]
         time_since_last = now - last_attempt
-        
-        # Delay doubles with each consecutive failure, starting at 1 second
-        # Calculate delay based on current session attempts
-        delay = min(max_delay, 2 ** (self.current_session_attempts - 1)) if self.current_session_attempts > 0 else 0
-        
+
+        # Exponential backoff: 1s, 2s, 4s, 8s… up to max_delay
+        delay = min(max_delay, 2 ** (count - 1))
+
+        # If enough time has passed, allow attempt & reset history
         if time_since_last >= delay:
-            return True, 0  # Enough time passed to allow attempt
-        
+            self.reset_session()
+            return True, 0
+
+        # Otherwise, still locked
         return False, delay - time_since_last
+
 
     def reset_session(self):
         """
         Reset current session attempt count and last attempt time.
         """
-        self.current_session_attempts = 0
-        self.last_attempt_time = None
+        self.dbmanager.clear_lockout_history()
 
     def get_status_message(self) -> str:
         """
@@ -92,14 +82,14 @@ class AdaptiveLockout:
         """
         allowed, delay = self.check_and_delay()
         
-        if delay == -1:
-            return "Vault locked due to repeated failures. Please use recovery key to unlock."
-        
         if not allowed:
-            return f"Too many failed attempts. Please wait {delay} seconds before trying again."
+            return f"Too many failed attempts. Please wait {delay} seconds."
+            
+        # Estimate attempts left (assuming 5 is the warning threshold)
+        timestamps = self.dbmanager.get_lockout_history()
+        attempts_left = max(0, 5 - len(timestamps))
         
-        attempts_left = max(0, 5 - self.current_session_attempts)
         if attempts_left == 0:
-            return "Multiple failed attempts detected. Delays will increase on further failures."
-        
-        return f"You have {attempts_left} attempts left before delays are enforced."
+            return "Multiple failed attempts detected. Delays are active."
+            
+        return f"You have {attempts_left} attempts left before delays begin."

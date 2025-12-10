@@ -9,12 +9,19 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 import warnings
+import re
 import json
 import uuid
 from src.config import DB_PATH, SCHEMA_PATH
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from src.crypto_engine import encrypt_entry, decrypt_entry, derive_master_key, generate_salt, generate_nonce, compute_auth_hash, compute_hmac
+from src.crypto_engine import encrypt_entry, decrypt_entry, derive_master_key, generate_salt, generate_nonce, compute_auth_hash, compute_hmac, derive_hkdf_key
+
+# ============ Validation Constants ============
+MAX_TITLE_LEN = 256
+MAX_URL_LEN = 2048      # Standard browser limit
+MAX_USERNAME_LEN = 256
+MAX_TAGS_LEN = 512
+MAX_NOTES_LEN = 32768   # 32KB limit for notes (enough for RSA keys)
+MAX_CATEGORY_LEN = 64
 
 class DatabaseError(Exception):
     """Base Exception for database operations"""
@@ -99,6 +106,54 @@ class DatabaseManager:
         """Context manager exit - auto-close"""
         self.close()
 
+    def _derive_entry_key(self, vault_key: bytes, entry_id:str, entry_salt: bytes) -> bytes:
+            """ 
+            Derive entry specific encryption key from vault key
+            
+            Args: 
+                - vault_key: 32-bytes vault key
+                - entry_id: Entry UUID string
+
+            Returns:
+                32-byte entry-specific key
+            """
+            # Encrypt the entry_key
+            return derive_hkdf_key(
+                master_key=vault_key,
+                info=entry_id.encode(),
+                salt=entry_salt,
+                length=32
+            )
+    
+    def _validate_entry_data(
+        self, 
+        title: Optional[str] = None, 
+        url: Optional[str] = None, 
+        username: Optional[str] = None, 
+        notes: Optional[str] = None,
+        tags: Optional[str] = None,
+        category: Optional[str] = None
+    ):
+        """Helper to enforce strict length limits on entry data."""
+        if title is not None:
+            if not title or len(title) > MAX_TITLE_LEN:
+                raise ValueError(f"Title must be 1-{MAX_TITLE_LEN} characters.")
+        
+        if url and len(url) > MAX_URL_LEN:
+            raise ValueError(f"URL exceeds max length of {MAX_URL_LEN}.")
+            
+        if username and len(username) > MAX_USERNAME_LEN:
+            raise ValueError(f"Username exceeds max length of {MAX_USERNAME_LEN}.")
+            
+        if tags and len(tags) > MAX_TAGS_LEN:
+            raise ValueError(f"Tags exceed max length of {MAX_TAGS_LEN}.")
+            
+        if category and len(category) > MAX_CATEGORY_LEN:
+            raise ValueError(f"Category exceeds max length of {MAX_CATEGORY_LEN}.")
+            
+        if notes and len(notes) > MAX_NOTES_LEN:
+            raise ValueError(f"Notes exceed max length of {MAX_NOTES_LEN} characters.")
+
     def get_all_entries(self, vault_key: bytes) -> List[Dict]:
         """
         Retrieve and decrypt ALL entries (used for backups).
@@ -135,28 +190,35 @@ class DatabaseManager:
             - FileNotFoundError: schema.sql not found
             - sqlite3.Error: SQL execution failed
         """
-        conn = self.connect()
-
-        # check if already initialized
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='vault_metadata'"
-        )
-        if cursor.fetchone():
-            return False  # Already initialized
-        
-        # Read schema file
         try:
-            with open(SCHEMA_PATH, 'r') as f:
-                schema_sql = f.read()
+            conn = self.connect()
+            
+            # Check if main table exists
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vault_metadata'"
+            )
+            already_init = cursor.fetchone() is not None
+            
+            if not already_init:
+                # Read and execute schema
+                with open(SCHEMA_PATH, 'r') as f:
+                    schema_sql = f.read()
+                conn.executescript(schema_sql)
 
-            # Execute schema
-            conn.executescript(schema_sql)
+            # FIX: Create dedicated table for Adaptive Lockout (Bug #13)
+            # This ensures concurrency safety across processes, unlike the JSON-in-metadata approach.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS lockout_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL  -- Unix timestamp
+                )
+            """)
+
             conn.commit()
             return True
-        except IOError as e:
-            raise DatabaseError(f"Failed to read schema file: {e}")
-        except sqlite3.Error as e:
-            raise DatabaseError(f"SQL execution failed: {e}")
+            
+        except (IOError, sqlite3.Error) as e:
+            raise DatabaseError(f"Critical: Database initialization failed: {e}")
     
     def save_vault_metadata(
             self,
@@ -186,29 +248,47 @@ class DatabaseManager:
         """
         conn = self.connect()
 
-        # check if already initialized
-        cursor = conn.execute("SELECT id FROM vault_metadata WHERE id = 1")
-        if cursor.fetchone():
-            return False # already initialized
-        
-        # Insert vault metadata
-        created_at = datetime.now().isoformat()
-        kdf_json = json.dumps(kdf_config) if kdf_config else None
+        try:
+            # FIX: Prepare the insert directly. 
+            # If ID=1 exists, this will raise IntegrityError (handled below).
+            
+            kdf_json = json.dumps(kdf_config) if kdf_config else None
+            
+            conn.execute("BEGIN IMMEDIATE")
+            
+            conn.execute("""
+                INSERT INTO vault_metadata (
+                    id, salt, auth_hash, 
+                    vault_key_encrypted, vault_key_nonce, vault_key_tag,
+                    kdf_config,
+                    created_at, version,
+                    unlock_count, last_unlocked_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, '2.0', 0, NULL)
+            """, (salt, auth_hash, vault_key_encrypted, vault_key_nonce,
+                  vault_key_tag, kdf_json, datetime.now().isoformat()))
+            
+            conn.commit()
+            return True
 
-        # FIXED: Explicitly mapping all columns to avoid parameter count mismatch
-        conn.execute("""
-            INSERT INTO vault_metadata (
-                id, salt, auth_hash, 
-                vault_key_encrypted, vault_key_nonce, vault_key_tag,
-                kdf_config,
-                created_at, version,
-                unlock_count, last_unlocked_at
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, '2.0', 0, NULL)
-        """, (salt, auth_hash, vault_key_encrypted, vault_key_nonce,
-              vault_key_tag, kdf_json, created_at))
+        except sqlite3.IntegrityError: 
+            # This catches the race condition
+            return False
+            
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to save metadata: {e}")
         
-        conn.commit()
-        return True
+    def delete_vault_metadata(self) -> None:
+        """
+        Emergency rollback: delete vault metadata if initialization verification fails.
+        """
+        try:
+            conn = self.connect()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM vault_metadata WHERE id = 1")
+            conn.commit()
+        except Exception as e:
+            # If rollback fails, we are in a bad state, but must try
+            warnings.warn(f"Failed to rollback vault metadata: {e}")
         
     def load_vault_metadata(self) -> Optional[Dict]:
         """
@@ -284,27 +364,6 @@ class DatabaseManager:
 
         return cursor.rowcount > 0 # True if row was updated
     
-    def _derive_entry_key(self, vault_key: bytes, entry_id:str) -> bytes:
-        """ 
-        Derive entry specific encryption key from vault key
-        
-        Args: 
-            - vault_key: 32-bytes vault key
-            - entry_id: Entry UUID string
-
-        Returns:
-            32-byte entry-specific key
-        """
-        # Encrypt the entry_key
-        entry_key  = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=entry_id.encode()
-        ).derive(vault_key)
-
-        return entry_key
-
     def add_entry(
             self, 
             vault_key: bytes, 
@@ -343,6 +402,11 @@ class DatabaseManager:
             if not title or not isinstance(title, str):
                 raise ValueError("Entry title must be a non-empty string")
             
+            self._validate_entry_data(
+                title=title, url=url, username=username, 
+                notes=notes, tags=tags, category=category
+            )
+
             if not isinstance(vault_key, bytes) or len(vault_key) != 32:
                 raise ValueError("Vault key must be 32 bytes")
             
@@ -350,8 +414,10 @@ class DatabaseManager:
             if entry_id is None:
                 entry_id = str(uuid.uuid4())
             
+            entry_salt = generate_salt(16)
+
             # Derive the entry key
-            entry_key = self._derive_entry_key(vault_key, entry_id)
+            entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
             
             # 1. Encrypt Password
             pw_payload = {"password": password or ""}
@@ -371,6 +437,7 @@ class DatabaseManager:
                     id, title, url, username,
                     password_encrypted, password_nonce, password_tag,
                     notes_encrypted, notes_nonce, notes_tag,
+                    kdf_salt,
                     tags, category, created_at, modified_at,
                     favorite, password_strength, password_age_days
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -378,6 +445,7 @@ class DatabaseManager:
                 entry_id, title, url, username,
                 pw_cipher, pw_nonce, pw_tag,          
                 notes_cipher, notes_nonce, notes_tag, 
+                entry_salt,
                 tags, category, now, now,
                 1 if favorite else 0,   
                 password_strength
@@ -442,8 +510,13 @@ class DatabaseManager:
             if row is None:
                 return None  # Entry not found is not an error
             
-            # Derive entry-specific key
-            entry_key = self._derive_entry_key(vault_key, entry_id)
+            try:
+                entry_salt = row["kdf_salt"]
+            except IndexError:
+                # Handle legacy schema gracefully if needed, or fail safe
+                raise DatabaseError("Database integrity error: Missing salt for entry.")
+
+            entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
             
             # Decrypt password field
             try:
@@ -456,9 +529,9 @@ class DatabaseManager:
                 password_dict = json.loads(password_data)
                 password = password_dict.get("password")
             except Exception as e:
-                warnings.warn(f"Failed to decrypt password for entry {entry_id}: {str(e)}")
                 password = None
-            
+                raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}. Data may be tampered or corrupt.")
+                
             # Decrypt notes field
             try:
                 notes_data = decrypt_entry(
@@ -470,8 +543,8 @@ class DatabaseManager:
                 notes_dict = json.loads(notes_data)
                 notes = notes_dict.get("notes")
             except Exception as e:
-                warnings.warn(f"Failed to decrypt notes for entry {entry_id}: {str(e)}")
                 notes = None
+                raise DatabaseError(f"CRITICAL: Notes decryption failed for {entry_id}.")
             
             # Update last accessed timestamp
             now = datetime.now(timezone.utc).isoformat()
@@ -482,7 +555,7 @@ class DatabaseManager:
                 )
                 conn.commit()
             except sqlite3.OperationalError as e:
-                warnings.warn(f"Failed to update last_accessed_at: {str(e)}")
+                pass
             
             modified_date = datetime.fromisoformat(row["modified_at"])
             age_days = (datetime.now(timezone.utc) - modified_date).days
@@ -548,6 +621,11 @@ class DatabaseManager:
             if not entry_id or not isinstance(entry_id, str):
                 raise ValueError("Entry ID must be a non-empty string")
             
+            self._validate_entry_data(
+                title=title, url=url, username=username, 
+                notes=notes, tags=tags, category=category
+            )
+            
             if not isinstance(vault_key, bytes) or len(vault_key) != 32:
                 raise ValueError("Vault key must be 32 bytes")
             
@@ -555,12 +633,16 @@ class DatabaseManager:
             
             # Check if entry exists
             cursor = conn.execute(
-                "SELECT id FROM entries WHERE id = ? AND is_deleted = 0",
+                "SELECT id, kdf_salt FROM entries WHERE id = ? AND is_deleted = 0",
                 (entry_id,)
             )
+
+            row = cursor.fetchone()
             
-            if cursor.fetchone() is None:
+            if row is None:
                 return False  # Entry not found
+            
+            current_salt = row['kdf_salt']
             
             fields = []
             values = []
@@ -596,7 +678,7 @@ class DatabaseManager:
             
             # If password or notes changed, re-encrypt
             if password is not None or notes is not None:
-                entry_key = self._derive_entry_key(vault_key, entry_id)
+                entry_key = self._derive_entry_key(vault_key, entry_id, current_salt)
                 
                 if password is not None:
                     payload = {"password": password}
@@ -613,9 +695,9 @@ class DatabaseManager:
                     fields.extend(["notes_encrypted = ?", "notes_nonce = ?", "notes_tag = ?"])
                     values.extend([ciphertext, nonce, tag])
             
-            # If no fields to update, return True (nothing to do)
+            # If no fields to update, return False (indicates nothing happened)
             if not fields:
-                return True
+                return False
             
             # Always update modified_at
             now = datetime.now(timezone.utc).isoformat()
@@ -683,7 +765,12 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error deleting entry: {str(e)}")
 
-    def list_entries(self, include_deleted: bool = False) -> List[Dict]:
+    def list_entries(
+            self, 
+            include_deleted: bool = False, 
+            limit: int = 100, 
+            offset: int = 0
+    ) -> List[Dict]:
         """ 
         List all entries (metadata only, no decryption)
         
@@ -693,33 +780,28 @@ class DatabaseManager:
         Returns:
             - List of entry metadata dictionaries (passwords NOT decrypted)
         """
-        # TODO: Implement entry listing
-        # HINTS:
-        # 1. SELECT id, title, url, username, tags, category, created_at, modified_at
-        # FROM entries
-        # WHERE is_deleted = 0 (or 1 if include_deleted)
-        # 2. Convert rows to list of dicts
-        # 3. Return list (may be empty)
-        
         try:
             conn = self.connect()
             
             if include_deleted:
-                cursor = conn.execute("""
+                sql = """
                     SELECT id, title, url, username, tags, category, created_at, modified_at, is_deleted, deleted_at
                     FROM entries
-                """)
+                    ORDER BY modified_at DESC
+                    LIMIT ? OFFSET ?
+                """
             else:
-                cursor = conn.execute("""
+                sql = """
                     SELECT id, title, url, username, tags, category, created_at, modified_at
                     FROM entries
                     WHERE is_deleted = 0
-                """)
+                    ORDER BY modified_at DESC
+                    LIMIT ? OFFSET ?
+                """
             
-            rows = cursor.fetchall()
-            
-            # Convert rows to list of dicts
-            entries = [dict(row) for row in rows]
+            # Pass limit/offset safely as parameters
+            cursor = conn.execute(sql, (limit, offset))
+            return [dict(row) for row in cursor.fetchall()]
             
             return entries
             
@@ -859,7 +941,9 @@ class DatabaseManager:
     def search_entries(
         self,
         query: str,
-        include_deleted: bool = False
+        include_deleted: bool = False,
+        limit: int = 50, 
+        offset: int =0
     ) -> List[Dict]:
         """
         Search entries by title/URL/tags
@@ -883,61 +967,120 @@ class DatabaseManager:
         """
         try:
             conn = self.connect()
-            search_query = f"{query.strip()}"
-            
-            if include_deleted:
-                # STRATEGY 2: Recovery Mode (Bypass FTS) -> Uses LIKE
-                safe = search_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                wildcard = f"%{safe}%"
-                # Since schema triggers remove deleted items from the FTS index,
-                # we must scan the 'entries' table directly to find them.
-                sql = """
-                    SELECT id, title, url, username, tags, category, 
-                        created_at, modified_at, is_deleted
-                    FROM entries
-                    WHERE (
-                        title LIKE ? ESCAPE '\\' OR 
-                        url LIKE ? ESCAPE '\\' OR 
-                        username LIKE ? ESCAPE '\\' OR 
-                        tags LIKE ? ESCAPE '\\'
-                    )
-                """
-                # Add wildcards for substring matching
-                params = [wildcard, wildcard, wildcard, wildcard]
-                
-            else:
-                # STRATEGY 1: Secure Speed Mode (FTS Index)
-                # Robust FTS: Split terms to allow "foo bar" to match "foo...bar" or "bar...foo"
-                # rather than enforcing an exact phrase match of "foo bar".
-                
-                terms = search_query.split()
-                
-                if not terms:
-                    return []
+            query = query.strip()
+            if not query: return []
 
-                # 1. Sanitize: Escape double quotes inside terms (standard SQL escaping)
-                # 2. Tokenize: Wrap each term in quotes and append * for prefix matching
-                #    Input:  foo "bar
-                #    Output: "foo"* """bar"*
-                safe_terms = [f'"{t.replace("\"", "\"\"")}"*' for t in terms]
+            # 1. VALIDATION
+            safe_token_pattern = re.compile(r'^[a-zA-Z0-9._-]{1,30}$')
+            terms = query.split()
+            
+            # 2. DECISION: Prefer FTS, fallback to LIKE for symbols
+            use_fts = True
+            
+            # If requesting trash, we MUST use LIKE (trash not in FTS)
+            if include_deleted:
+                use_fts = False
+            else:
+                # If query has symbols, FTS tokenizers might choke/strip them.
+                # Fallback to LIKE to ensure we find "C++" or "user@email".
+                for term in terms:
+                    if not safe_token_pattern.match(term):
+                        use_fts = False
+                        break
+
+            # 3. EXECUTION
+            if use_fts:
+                # --- FAST PATH (FTS) ---
+                fts_query = " ".join([f'"{t}"*' for t in terms])
                 
-                # 3. Join: Space implies implicit AND in FTS5
-                fts_query = " ".join(safe_terms)
-                
+                # FTS query structure is rigid, so we hardcode the filter
                 sql = """
                     SELECT e.id, e.title, e.url, e.username, e.tags, e.category, 
-                        e.created_at, e.modified_at, e.is_deleted
+                           e.created_at, e.modified_at, e.is_deleted, e.password_strength
                     FROM entries e
-                    JOIN entries_fts ON e.rowid = entries_fts.rowid      
-                    WHERE entries_fts MATCH ?
+                    JOIN entries_fts f ON e.rowid = f.rowid
+                    WHERE entries_fts MATCH ? AND e.is_deleted = 0
+                    ORDER BY rank
+                    LIMIT ? OFFSET ?
                 """
-                params = [fts_query]
+                params = [fts_query, limit, offset]
+                
+            else:
+                # --- ROBUST PATH (LIKE) ---
+                safe_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                wildcard = f"%{safe_query}%"
+                
+                # Construct WHERE clauses as a list to prevent logic errors
+                where_clauses = [
+                    "(title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR "
+                    "username LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')"
+                ]
+                
+                # Explicitly add deletion filter if needed
+                if not include_deleted:
+                    where_clauses.append("is_deleted = 0")
+                
+                # Join clauses safely
+                where_sql = " AND ".join(where_clauses)
+                
+                sql = f"""
+                    SELECT id, title, url, username, tags, category, 
+                           created_at, modified_at, is_deleted, password_strength
+                    FROM entries
+                    WHERE {where_sql}
+                    ORDER BY modified_at DESC
+                    LIMIT ? OFFSET ?
+                """
+                
+                params = [wildcard, wildcard, wildcard, wildcard, limit, offset]
 
             cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-
-            results = [dict(row) for row in rows]
-            return results
+            return [dict(row) for row in cursor.fetchall()]
         
         except Exception as e:
             raise DatabaseError(f"Failed to search entries: {e}")
+        
+    def record_lockout_failure(self) -> None:
+        """
+        Record a failed attempt and prune history older than 1 hour.
+        """
+        try:
+            conn = self.connect()
+            import time
+            now = int(time.time())
+            
+            # 1. Insert new failure
+            conn.execute("INSERT INTO lockout_attempts (timestamp) VALUES (?)", (now,))
+            
+            # 2. Prune old entries to prevent table bloat (keep last 1 hour)
+            conn.execute("DELETE FROM lockout_attempts WHERE timestamp < ?", (now - 3600,))
+            
+            conn.commit()
+        except Exception as e:
+            warnings.warn(f"Failed to record lockout failure: {e}")
+
+    def get_lockout_history(self, since_timestamp: int = 0) -> List[int]:
+        """
+        Retrieve lockout timestamps, optionally filtering by a cutoff time.
+        """
+        try:
+            conn = self.connect()
+            cursor = conn.execute(
+                "SELECT timestamp FROM lockout_attempts WHERE timestamp >= ? ORDER BY timestamp ASC",
+                (since_timestamp,)
+            )
+            return [row["timestamp"] for row in cursor.fetchall()]
+        except Exception:
+            return []
+        
+    
+    def clear_lockout_history(self) -> None:
+        """
+        Reset lockout history (e.g., after successful login or delay expiration).
+        """
+        try:
+            conn = self.connect()
+            conn.execute("DELETE FROM lockout_attempts")
+            conn.commit()
+        except Exception:
+            pass

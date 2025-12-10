@@ -12,6 +12,8 @@ import hashlib
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
 import json
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import hmac
 
 
@@ -457,3 +459,35 @@ def verify_auth_hash(stored_hash: bytes, password: str, salt: bytes) -> bool:
     """
     computed = compute_auth_hash(password, salt)
     return hmac.compare_digest(computed, stored_hash)
+
+# ... existing code ...
+
+def derive_hkdf_key(
+    master_key: bytes,
+    info: bytes,
+    salt: bytes = None,
+    length: int = 32
+) -> bytes:
+    """
+    Derive a sub-key from a master key using HKDF-SHA256.
+    
+    Args:
+        master_key: The source key material (e.g., vault_key).
+        info: Context-specific byte string (e.g., b"backup-enc").
+              Different 'info' produces completely different keys.
+        salt: Optional salt. If None, defaults to a string of zero bytes.
+        length: Desired output length in bytes (default 32).
+        
+    Returns:
+        Derived key bytes.
+    """
+    if not isinstance(master_key, bytes):
+        raise TypeError("Master key must be bytes")
+        
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
+        info=info
+    )
+    return hkdf.derive(master_key)

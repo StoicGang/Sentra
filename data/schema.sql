@@ -34,13 +34,12 @@ CREATE TABLE IF NOT EXISTS vault_metadata (
 -- TABLE 2: entries (Core Data)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS entries (
-    id TEXT PRIMARY KEY,                    -- UUID
+    id TEXT PRIMARY KEY,                    
     title TEXT NOT NULL,                    
     url TEXT,                               
     username TEXT,                          
     
-    -- Encrypted Data (ChaCha20-Poly1305)
-    -- NOTE: Password and Notes are encrypted separately with different nonces
+    -- Encryption Data
     password_encrypted BLOB NOT NULL,       
     password_nonce BLOB NOT NULL,           
     password_tag BLOB NOT NULL,             
@@ -49,10 +48,14 @@ CREATE TABLE IF NOT EXISTS entries (
     notes_nonce BLOB,                       
     notes_tag BLOB,                         
     
+    -- NEW: Per-Entry Salt for HKDF (Fixes QA Issue #8)
+    -- This ensures every entry has a unique key derivation path
+    kdf_salt BLOB NOT NULL,                         
+    
     -- Organization & Metadata
     tags TEXT,                              
     category TEXT DEFAULT 'General',        
-    favorite INTEGER DEFAULT 0 CHECK (favorite IN (0, 1)), -- Boolean enforcement
+    favorite INTEGER DEFAULT 0 CHECK (favorite IN (0, 1)), 
     
     -- Timestamps
     created_at TEXT NOT NULL,               
@@ -63,8 +66,8 @@ CREATE TABLE IF NOT EXISTS entries (
     password_strength INTEGER CHECK (password_strength BETWEEN 0 AND 100),
     password_age_days INTEGER DEFAULT 0,
     
-    -- Soft Delete (Trash System)
-    is_deleted INTEGER DEFAULT 0 CHECK (is_deleted IN (0, 1)), -- Boolean enforcement
+    -- Soft Delete
+    is_deleted INTEGER DEFAULT 0 CHECK (is_deleted IN (0, 1)),
     deleted_at TEXT                         
 );
 
@@ -108,6 +111,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- ============================================================================
+-- TABLE 6: lockout_attempts (New: Adaptive Lockout Concurrency Safety)
+-- ============================================================================
+-- Tracks timestamps of recent failed attempts for the sliding window lockout.
+-- Uses INTEGER timestamps (Unix Epoch) for efficient math.
+CREATE TABLE IF NOT EXISTS lockout_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL
+);
+
+-- ============================================================================
 -- INDEXES (Performance)
 -- ============================================================================
 CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title);
@@ -115,6 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_entries_category ON entries(category);
 CREATE INDEX IF NOT EXISTS idx_entries_tags ON entries(tags);
 CREATE INDEX IF NOT EXISTS idx_entries_deleted ON entries(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_failed_attempts ON failed_attempts_log(attempt_timestamp);
+CREATE INDEX IF NOT EXISTS idx_lockout_timestamp ON lockout_attempts(timestamp);
 
 -- ============================================================================
 -- FULL-TEXT SEARCH (FTS5) - Synchronized with Soft Deletes

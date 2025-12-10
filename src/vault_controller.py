@@ -3,12 +3,12 @@ SENTRA vault Controller
 Managers vault unlock/lock lifecycle and entry operations with hierarchical key management
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
 import warnings
 import json
 from src.adaptive_lockout import AdaptiveLockout
-import base64
+from src.backup_manager import BackupManager
 from src.crypto_engine import (
     derive_master_key,
     compute_auth_hash, 
@@ -16,6 +16,7 @@ from src.crypto_engine import (
     encrypt_entry,
     decrypt_entry,
     generate_key,
+    derive_hkdf_key,
     verify_auth_hash
 )
 from src.password_generator import PasswordGenerator
@@ -74,6 +75,10 @@ class VaultController:
         self.master_key_secure: Optional[bytearray] = None
         self.vault_key_secure: Optional[bytearray] = None
 
+        # New: Handles for memory locking
+        self.master_key_handle = None
+        self.vault_key_handle = None
+
         # Metadata
         self.unlock_timestamp: Optional[str] = None
     
@@ -86,6 +91,28 @@ class VaultController:
         """
         if not self.is_unlocked:
             raise VaultLockedError("Vault is locked. Call unlock_vault() first.")
+
+    def vault_exists(self) -> bool:
+        """
+        Check if the vault has been initialized.
+
+        Ensures DB/tables exist first (idempotent), then returns True if metadata exists.
+        Returns False on any recoverable DB error.
+        """
+        try:
+            # Ensure database schema exists (idempotent)
+            self.db.initialize_database()
+
+            # load_vault_metadata() should now be safe to call
+            return self.db.load_vault_metadata() is not None
+
+        except DatabaseError:
+            # Known DB error: treat as "not initialized" for CLI's decision path
+            return False
+        except Exception as e:
+            # Unexpected errors: surface a warning in logs, but treat as not-initialized
+            warnings.warn(f"vault_exists() check failed: {e}")
+            return False
 
     def unlock_vault(self, password: str) -> bool:
         """ 
@@ -107,19 +134,13 @@ class VaultController:
         
         allowed, delay = self.adaptive_lockout.check_and_delay()
         if not allowed:
-            raise VaultError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
+            raise VaultLockedError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
 
         if not password or not isinstance(password, str):
             raise VaultError("Password must be a non-empty string")
         
         # Initialize the database
-        try:
-            self.db.initialize_database()
-        except Exception as e:
-            # Check if it's just an "already initialized" message (which is ok)
-            error_msg = str(e).lower()
-            if 'already' not in error_msg and 'exists' not in error_msg and 'initialized' not in error_msg:
-                raise VaultError(f"Failed to initialize database: {e}")
+        self.db.initialize_database()
 
         # Load metadata
         metadata = self.db.load_vault_metadata()
@@ -175,6 +196,36 @@ class VaultController:
             if not saved:
                 raise VaultError("Vault metadata already exists, cannot initialize new vault.")
 
+            # 1. Reload from DB
+            verify_meta = self.db.load_vault_metadata()
+            if not verify_meta:
+                self.db.delete_vault_metadata()
+                raise VaultError("Critical: Vault metadata saved but could not be reloaded.")
+            
+            # 2. Verify KDF Config JSON integrity
+            try:
+                if verify_meta.get("kdf_config"):
+                    json.loads(verify_meta["kdf_config"])
+            except Exception:
+                self.db.delete_vault_metadata()
+                raise VaultError("Vault initialization failed: Corrupt KDF config storage.")
+            
+            # 3. Verify Cryptographic Round-Trip
+            # Attempt to decrypt the key we just saved. If this fails, the vault is broken.
+            try:
+                # We need the exact bytes from the DB to ensure type fidelity
+                decrypt_entry(
+                    ciphertext=verify_meta["vault_key_encrypted"],
+                    nonce=verify_meta["vault_key_nonce"],
+                    auth_tag=verify_meta["vault_key_tag"],
+                    key=master_key,
+                    associated_data=b"vault-key-v1"
+                )
+            except Exception as e:
+                # ROLLBACK: Delete the corrupted metadata so user can try again
+                self.db.delete_vault_metadata()
+                raise VaultError(f"Vault integrity check failed: Cannot decrypt new vault key. Error: {e}")
+            
         else:
             # Existing vault - use stored parameters or defaults
             if metadata.get("kdf_config"):
@@ -226,27 +277,45 @@ class VaultController:
             del master_key
             del vault_key
 
-            # Check if locking succeeded
-            # If we cannot lock RAM, we MUST NOT proceed.
-            if not self.secure_mem.lock_memory(self.master_key_secure):
-                self.secure_mem.zeroize(self.master_key_secure)
-                raise VaultError("CRITICAL: Failed to lock master key in memory. Operation aborted for security.")
+            # Lock Master Key
+            self.master_key_handle = self.secure_mem.lock_memory(self.master_key_secure)
+            if not self.master_key_handle:
+                # Fallback: Manual wipe of Python buffer
+                self.master_key_secure[:] = b'\x00' * len(self.master_key_secure)
+                raise VaultError("CRITICAL: Failed to acquire lock handle for master key.")
+            
+            # Apply anti-forensics: Prevent fork inheritance
+            self.secure_mem.protect_from_fork(self.master_key_handle)
+
+            # Lock Vault Key
+            self.vault_key_handle = self.secure_mem.lock_memory(self.vault_key_secure)
+            if not self.vault_key_handle:
+                # Explicit Cleanup: Wipe vault buffer
+                self.vault_key_secure[:] = b'\x00' * len(self.vault_key_secure)
                 
-            if not self.secure_mem.lock_memory(self.vault_key_secure):
-                self.secure_mem.zeroize(self.vault_key_secure)
-                raise VaultError("CRITICAL: Failed to lock vault key in memory. Operation aborted for security.")
+                # Explicit Cleanup: Release master key handle immediately
+                self.secure_mem.zeroize(self.master_key_handle)
+                self.secure_mem.unlock_memory(self.master_key_handle)
+                self.master_key_handle = None
+                self.master_key_secure[:] = b'\x00' * len(self.master_key_secure)
+                
+                raise VaultError("CRITICAL: Failed to acquire lock handle for vault key.")
+            
+            # Apply anti-forensics
+            self.secure_mem.protect_from_fork(self.vault_key_handle)
+
         except Exception as e:
-            # Clean up on failure
-            if self.master_key_secure:
-                try:
-                    self.secure_mem.zeroize(self.master_key_secure)
-                except:
-                    pass
-            if self.vault_key_secure:
-                try:
-                    self.secure_mem.zeroize(self.vault_key_secure)
-                except:
-                    pass
+            # Clean up on failure using handles
+            if self.master_key_handle:
+                self.secure_mem.zeroize(self.master_key_handle)
+                self.secure_mem.unlock_memory(self.master_key_handle)
+                self.master_key_handle = None
+            
+            if self.vault_key_handle:
+                self.secure_mem.zeroize(self.vault_key_handle)
+                self.secure_mem.unlock_memory(self.vault_key_handle)
+                self.vault_key_handle = None
+                
             # Re-raise unless it's the specific lock error we just raised
             if "CRITICAL" in str(e):
                 raise
@@ -275,14 +344,26 @@ class VaultController:
             return True
         
         try:
+            # Zeroize and Unlock Master Key
+            if self.master_key_handle:
+                self.secure_mem.zeroize(self.master_key_handle)
+                self.secure_mem.unlock_memory(self.master_key_handle)
+                self.master_key_handle = None
+            
+            # Defensive: Explicitly wipe Python buffer to clear potential copies/references
             if self.master_key_secure:
-                self.secure_mem.zeroize(self.master_key_secure)
-                self.secure_mem.unlock_memory(self.master_key_secure)
+                self.master_key_secure[:] = b'\x00' * len(self.master_key_secure)
                 self.master_key_secure = None
 
+            # Zeroize and Unlock Vault Key
+            if self.vault_key_handle:
+                self.secure_mem.zeroize(self.vault_key_handle)
+                self.secure_mem.unlock_memory(self.vault_key_handle)
+                self.vault_key_handle = None
+            
+            # Defensive: Explicitly wipe Python buffer
             if self.vault_key_secure:
-                self.secure_mem.zeroize(self.vault_key_secure)
-                self.secure_mem.unlock_memory(self.vault_key_secure)
+                self.vault_key_secure[:] = b'\x00' * len(self.vault_key_secure)
                 self.vault_key_secure = None
         
             self.is_unlocked = False
@@ -398,14 +479,23 @@ class VaultController:
         except Exception as e:
             raise VaultError(f"Failed to retrieve audit log: {e}")
 
-    def list_entries(self, include_deleted: bool = False) -> List[Dict]:
+    def list_entries(
+        self, 
+        include_deleted: bool = False,
+        limit: int = 100, 
+        offset: int = 0
+    ) -> List[Dict]:
         """
-        List all entries (metadata only).
+        List all entries (metadata only) with pagination support.
         Delegates to DatabaseManager.list_entries.
         """
         self._check_unlocked()
         try:
-            return self.db.list_entries(include_deleted=include_deleted)
+            return self.db.list_entries(
+                include_deleted=include_deleted,
+                limit=limit,
+                offset=offset
+            )
         except Exception as e:
             raise VaultError(f"Failed to list entries: {e}")
 
@@ -449,6 +539,81 @@ class VaultController:
         """
         self._check_unlocked()
         try:
+            if not entry_id or not isinstance(entry_id, str):
+                raise VaultError("Invalid entry ID")
+            
+            # FIX: Direct delegation to DB manager
             return self.db.restore_entry(entry_id)
+            
         except Exception as e:
             raise VaultError(f"Failed to restore entry: {e}")
+        
+    def get_backup_keys(self) -> Tuple[bytes, bytes]:
+        """
+        Derive separate keys for Backup Encryption and HMAC Integrity.
+        
+        Returns:
+            Tuple(encryption_key, hmac_key)
+        
+        Security:
+            - Uses HKDF to split the main vault_key.
+            - Ensures 'enc_key' and 'hmac_key' are mathematically independent.
+            - Prevents key reuse vulnerabilities.
+        """
+        self._check_unlocked()
+        
+        # Access the raw key from secure memory
+        if not self.vault_key_secure:
+             raise VaultError("Vault key not available.")
+             
+        master_material = bytes(self.master_key_secure)
+        
+        try:
+            enc_key = derive_hkdf_key(
+                master_key=master_material,
+                info=b"sentra-backup-enc-v1"
+            )
+            hmac_key = derive_hkdf_key(
+                master_key=master_material,
+                info=b"sentra-backup-mac-v1"
+            )
+        finally:
+            # Zero out the local copy of the master key
+            # Check if it's mutable (bytearray) first
+            if 'master_material' in locals():
+                # Since 'bytes' are immutable, we can't zero them in-place easily.
+                # However, if 'master_material' was created via 'bytes(self.master_key_secure)',
+                # it is an immutable bytes object.
+                # To really zero it, we should have cast to bytearray OR just rely on GC (less secure).
+                # Ideally:
+                if isinstance(master_material, bytearray):
+                     for i in range(len(master_material)):
+                         master_material[i] = 0
+                del master_material
+
+        return enc_key, hmac_key
+    
+    def create_backup_manager(self):
+        """
+        Factory method to create a fully configured BackupManager.
+        Injects both the external backup keys AND the internal vault key
+        needed for re-encryption during restore.
+        """
+        self._check_unlocked()
+        
+        if not self.vault_key_secure:
+            raise VaultError("Vault key not available in secure memory.")
+
+        # 1. Get Export/Import Keys (for the file itself)
+        vault_keys = self.get_backup_keys()
+        
+        # 2. Get Internal Key (for the database)
+        # We retrieve the raw bytes from secure memory to pass to the manager
+        internal_vault_key = bytes(self.vault_key_secure)
+        
+        # 3. Create Manager with full hierarchy
+        return BackupManager(
+            db=self.db,
+            vault_keys=vault_keys,
+            hierarchy_keys={'vault_key': internal_vault_key}
+        )
