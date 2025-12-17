@@ -123,8 +123,6 @@ class SecureMemory:
         except Exception as e:
             warnings.warn(f"SecureMemory init failed: {e}. Running in degraded mode.")
     
-    # What if the Virtuallock/ VirtualUnlock fails
-
     def lock_memory(self, data: bytes) -> bool:
         """
         Lock memory region to prevent swapping to disk
@@ -133,9 +131,9 @@ class SecureMemory:
             data: Bytes object to lock in memory
             
         Returns:
-            True if successfully locked
-            False if degraded mode (warning issued, but continued)
-            
+            SecureMemoryHandle if locking attempted (even in degraded mode)
+            None if input is invalid or length is zero
+                
         Security:
             - Prevents sensitive data from being written to disk
             - Graceful degradation if privileges insufficient 

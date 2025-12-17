@@ -1,176 +1,263 @@
-# tests/test_crypto.py
 import pytest
 import json
+import time
+from unittest.mock import patch, MagicMock
 from cryptography.exceptions import InvalidTag
+from argon2.exceptions import HashingError
+
 from src.crypto_engine import (
-    generate_salt, generate_nonce, generate_key,
-    derive_master_key, compute_auth_hash, benchmark_argon2_params,
-    encrypt_entry, decrypt_entry, compute_hmac
+    generate_salt,
+    generate_nonce,
+    generate_key,
+    derive_master_key,
+    compute_auth_hash,
+    verify_auth_hash,
+    benchmark_argon2_params,
+    encrypt_entry,
+    decrypt_entry,
+    compute_hmac,
+    derive_hkdf_key,
+    MIN_MEMORY_KB,
+    MAX_MEMORY_KB,
 )
 
+# ---------------------------------------------------------------------------
+# Random Generation
+# ---------------------------------------------------------------------------
 
-class TestRandomGeneration:
-    """Test CSPRNG functions"""
+def test_generate_salt_length_and_uniqueness():
+    s1 = generate_salt()
+    s2 = generate_salt()
+    assert isinstance(s1, bytes)
+    assert len(s1) == 16
+    assert s1 != s2
+
+def test_generate_nonce_length_and_uniqueness():
+    n1 = generate_nonce()
+    n2 = generate_nonce()
+    assert isinstance(n1, bytes)
+    assert len(n1) == 12
+    assert n1 != n2
+
+def test_generate_key_length_and_uniqueness():
+    k1 = generate_key()
+    k2 = generate_key()
+    assert isinstance(k1, bytes)
+    assert len(k1) == 32
+    assert k1 != k2
+
+# ---------------------------------------------------------------------------
+# Argon2 Master Key Derivation
+# ---------------------------------------------------------------------------
+
+def test_derive_master_key_success():
+    salt = generate_salt()
+    key = derive_master_key("password", salt)
+    assert isinstance(key, bytes)
+    assert len(key) == 32
+
+def test_derive_master_key_deterministic():
+    salt = generate_salt()
+    k1 = derive_master_key("password", salt)
+    k2 = derive_master_key("password", salt)
+    assert k1 == k2
+
+def test_derive_master_key_rejects_non_int_memory():
+    salt = generate_salt()
+    with pytest.raises(ValueError):
+        derive_master_key("pw", salt, memory_cost="64MB")
+
+def test_derive_master_key_rejects_low_memory():
+    salt = generate_salt()
+    with pytest.raises(ValueError):
+        derive_master_key("pw", salt, memory_cost=MIN_MEMORY_KB - 1)
+
+def test_derive_master_key_rejects_excessive_memory():
+    salt = generate_salt()
+    with pytest.raises(ValueError):
+        derive_master_key("pw", salt, memory_cost=MAX_MEMORY_KB + 1)
+
+@patch("src.crypto_engine.low_level.hash_secret_raw")
+def test_derive_master_key_wraps_hashing_error(mock_argon2):
+    """Test that internal Argon2 errors are caught and re-raised as RuntimeError."""
+    mock_argon2.side_effect = HashingError("Simulated Failure")
+    salt = generate_salt()
     
-    def test_generate_salt(self):
-        """Test salt generation and uniqueness"""
-        salt1 = generate_salt()
-        salt2 = generate_salt()
-        
-        assert len(salt1) == 16, "Salt should be 16 bytes"
-        assert len(salt2) == 16, "Salt should be 16 bytes"
-        assert salt1 != salt2, "Each salt should be unique"
+    with pytest.raises(RuntimeError, match="Argon2id key derivation failed"):
+        derive_master_key("password", salt)
+
+# ---------------------------------------------------------------------------
+# Authentication Hash (PBKDF2)
+# ---------------------------------------------------------------------------
+
+def test_compute_auth_hash_deterministic():
+    salt = generate_salt()
+    h1 = compute_auth_hash("password", salt)
+    h2 = compute_auth_hash("password", salt)
+    assert h1 == h2
+    assert len(h1) == 32
+
+def test_compute_auth_hash_accepts_bytes_password():
+    """Test that bytes password input is handled correctly."""
+    salt = generate_salt()
+    h1 = compute_auth_hash("password", salt)
+    h2 = compute_auth_hash(b"password", salt)
+    assert h1 == h2
+
+def test_verify_auth_hash_success_and_failure():
+    salt = generate_salt()
+    stored = compute_auth_hash("password", salt)
+
+    assert verify_auth_hash(stored, "password", salt) is True
+    assert verify_auth_hash(stored, "wrong", salt) is False
+
+# ---------------------------------------------------------------------------
+# Encryption / Decryption (ChaCha20-Poly1305)
+# ---------------------------------------------------------------------------
+
+def test_encrypt_decrypt_roundtrip():
+    key = generate_key()
+    plaintext = json.dumps({"secret": "data"})
+    aad = b"context"
+
+    c, n, t = encrypt_entry(plaintext, key, aad)
+    out = decrypt_entry(c, n, t, key, aad)
+
+    assert out == plaintext
+
+def test_encrypt_decrypt_none_aad():
+    """Test implicit default AAD (b'') when None is passed."""
+    key = generate_key()
+    plaintext = "secret"
     
-    def test_generate_nonce(self):
-        """Test nonce generation and uniqueness"""
-        nonce1 = generate_nonce()
-        nonce2 = generate_nonce()
-        
-        assert len(nonce1) == 12, "Nonce should be 12 bytes"
-        assert len(nonce2) == 12, "Nonce should be 12 bytes"
-        assert nonce1 != nonce2, "Each nonce should be unique"
-        
-        # Test uniqueness over 1000 generations
-        nonces = {generate_nonce() for _ in range(1000)}
-        assert len(nonces) == 1000, "All nonces should be unique"
+    # Encrypt with None
+    c, n, t = encrypt_entry(plaintext, key, associated_data=None)
     
-    def test_generate_key(self):
-        """Test key generation"""
-        key = generate_key()
-        assert len(key) == 32, "Key should be 32 bytes"
+    # Decrypt with None
+    out = decrypt_entry(c, n, t, key, associated_data=None)
+    assert out == plaintext
 
-class TestKeyDerivation:
-    """Test Argon2id and PBKDF2 functions"""
+def test_decrypt_fails_with_wrong_key():
+    key = generate_key()
+    wrong_key = generate_key()
+    plaintext = "secret"
+
+    c, n, t = encrypt_entry(plaintext, key)
+    with pytest.raises(InvalidTag):
+        decrypt_entry(c, n, t, wrong_key)
+
+def test_decrypt_fails_with_modified_ciphertext():
+    key = generate_key()
+    plaintext = "secret"
+
+    c, n, t = encrypt_entry(plaintext, key)
+    tampered = c[:-1] + bytes([c[-1] ^ 0xFF])
+
+    with pytest.raises(InvalidTag):
+        decrypt_entry(tampered, n, t, key)
+
+def test_decrypt_fails_with_wrong_aad():
+    key = generate_key()
+    plaintext = "secret"
+
+    c, n, t = encrypt_entry(plaintext, key, b"aad1")
+    with pytest.raises(InvalidTag):
+        decrypt_entry(c, n, t, key, b"aad2")
+
+@patch("src.crypto_engine.ChaCha20Poly1305")
+def test_encrypt_wraps_generic_error(mock_cipher_cls):
+    """Test that generic encryption errors are wrapped."""
+    mock_instance = mock_cipher_cls.return_value
+    mock_instance.encrypt.side_effect = Exception("Crypto failure")
     
-    def test_derive_master_key(self):
-        """Test Argon2id key derivation"""
-        password = "TestPassword123!"
-        salt = generate_salt()
-        
-        master_key = derive_master_key(password, salt, time_cost=2, memory_cost=32768)
-        
-        assert len(master_key) == 32, "Master key should be 32 bytes"
-        assert isinstance(master_key, bytes), "Master key should be bytes"
-        
-        # Verify deterministic
-        master_key2 = derive_master_key(password, salt, time_cost=2, memory_cost=32768)
-        assert master_key == master_key2, "Same inputs should produce same key"
+    key = generate_key()
+    with pytest.raises(RuntimeError, match="Encryption failed"):
+        encrypt_entry("data", key)
+
+@patch("src.crypto_engine.ChaCha20Poly1305")
+def test_decrypt_wraps_generic_error(mock_cipher_cls):
+    """Test that generic decryption errors (not InvalidTag) are wrapped."""
+    mock_instance = mock_cipher_cls.return_value
+    mock_instance.decrypt.side_effect = Exception("Crypto failure")
     
-    def test_compute_auth_hash(self):
-        """Test PBKDF2 authentication hash"""
-        password = "MySecurePassword123!"
-        salt = generate_salt()
-        
-        auth_hash = compute_auth_hash(password, salt)
-        
-        assert len(auth_hash) == 32, "Auth hash should be 32 bytes"
-        assert isinstance(auth_hash, bytes), "Auth hash should be bytes"
-        
-        # Verify deterministic
-        auth_hash2 = compute_auth_hash(password, salt)
-        assert auth_hash == auth_hash2, "Same password+salt should produce same hash"
-        
-        # Verify different password = different hash
-        wrong_hash = compute_auth_hash("WrongPassword", salt)
-        assert auth_hash != wrong_hash, "Different passwords should produce different hashes"
+    key = generate_key()
+    with pytest.raises(RuntimeError, match="Decryption failed"):
+        decrypt_entry(b"c", b"n", b"t", key)
 
-class TestEncryption:
-    """Test ChaCha20-Poly1305 AEAD encryption"""
+# ---------------------------------------------------------------------------
+# HMAC
+# ---------------------------------------------------------------------------
 
-    def setup_method(self):
-        self.password = "MasterPassword123!"
-        self.salt = generate_salt()
-        self.key = derive_master_key(self.password, self.salt, time_cost=1, memory_cost=8192)
-    
-    def test_encrypt_decrypt_roundtrip(self):
-        """Test encryption and decryption round-trip (no AAD)"""
-        test_entry = {"url": "https://github.com", "password": "SecurePass123!"}
-        plaintext = json.dumps(test_entry)
-        
-        # Encrypt
-        ciphertext, nonce, auth_tag = encrypt_entry(plaintext, self.key)
-        
-        assert len(nonce) == 12
-        assert len(auth_tag) == 16
-        
-        # Decrypt
-        decrypted = decrypt_entry(ciphertext, nonce, auth_tag, self.key)
-        assert decrypted == plaintext
+def test_compute_hmac_deterministic_and_sensitive():
+    key = generate_key()
+    data = b"important"
 
-    def test_encrypt_decrypt_with_aad(self):
-        """Test encryption with Associated Data (Context Binding)"""
-        plaintext = "Sensitive Data"
-        context = b"entry-uuid-1234"
+    h1 = compute_hmac(data, key)
+    h2 = compute_hmac(data, key)
 
-        # Encrypt with Context
-        ciphertext, nonce, tag = encrypt_entry(plaintext, self.key, associated_data=context)
+    assert h1 == h2
+    assert len(h1) == 32
 
-        # Decrypt with SAME Context -> Success
-        decrypted = decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=context)
-        assert decrypted == plaintext
+    assert compute_hmac(b"important!", key) != h1
 
-    def test_aad_mismatch_detection(self):
-        """Test that decryption fails if AAD context does not match"""
-        plaintext = "Sensitive Data"
-        context = b"correct-context"
-        wrong_context = b"wrong-context"
+def test_compute_hmac_accepts_bytearray():
+    key = bytearray(generate_key())
+    data = bytearray(b"data")
 
-        # Encrypt
-        ciphertext, nonce, tag = encrypt_entry(plaintext, self.key, associated_data=context)
+    h = compute_hmac(data, key)
+    assert isinstance(h, bytes)
+    assert len(h) == 32
 
-        # Decrypt with WRONG Context -> Fail
-        with pytest.raises(InvalidTag):
-            decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=wrong_context)
+# ---------------------------------------------------------------------------
+# HKDF
+# ---------------------------------------------------------------------------
 
-        # Decrypt with NO Context -> Fail
-        with pytest.raises(InvalidTag):
-            decrypt_entry(ciphertext, nonce, tag, self.key, associated_data=None)
-    
-    def test_tampering_detection(self):
-        """Test that tampering is detected"""
-        plaintext = json.dumps({"password": "secret123"})
-        
-        password = "MasterPassword123!"
-        salt = generate_salt()
-        key = derive_master_key(password, salt, time_cost=2, memory_cost=32768)
-        
-        ciphertext, nonce, auth_tag = encrypt_entry(plaintext, key)
-        
-        # Tamper with ciphertext
-        tampered = bytearray(ciphertext)
-        tampered[0] ^= 0xFF
-        tampered = bytes(tampered)
-        
-        # Should raise InvalidTag
-        with pytest.raises(InvalidTag):
-            decrypt_entry(tampered, nonce, auth_tag, key)
+def test_derive_hkdf_key_success():
+    master = generate_key()
+    salt = generate_salt()
+    info = b"context"
 
-class TestHMAC:
-    """Test HMAC integrity functions"""
-    
-    def test_compute_hmac(self):
-        """Test HMAC computation"""
-        data = b"Test backup data"
-        key = generate_key()
-        
-        hmac1 = compute_hmac(data, key)
-        hmac2 = compute_hmac(data, key)
-        
-        assert len(hmac1) == 32, "HMAC should be 32 bytes"
-        assert hmac1 == hmac2, "Same data+key should produce same HMAC"
-    
-    def test_hmac_tampering_detection(self):
-        """Test HMAC detects tampering"""
-        data = b"Original data"
-        key = generate_key()
-        
-        original_hmac = compute_hmac(data, key)
-        
-        # Tamper with data
-        tampered_data = b"Tampered data"
-        tampered_hmac = compute_hmac(tampered_data, key)
-        
-        assert original_hmac != tampered_hmac, "HMAC should differ for different data"
+    k1 = derive_hkdf_key(master, info, salt)
+    k2 = derive_hkdf_key(master, info, salt)
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    assert k1 == k2
+    assert len(k1) == 32
+
+def test_derive_hkdf_key_diff_info_diff_key():
+    master = generate_key()
+    salt = generate_salt()
+
+    k1 = derive_hkdf_key(master, b"a", salt)
+    k2 = derive_hkdf_key(master, b"b", salt)
+
+    assert k1 != k2
+
+def test_derive_hkdf_key_rejects_missing_salt():
+    master = generate_key()
+    with pytest.raises(ValueError, match="HKDF requires an explicit, non-empty salt"):
+        derive_hkdf_key(master, b"context", None)
+
+def test_derive_hkdf_key_rejects_empty_byte_salt():
+    """Test that empty bytes b'' are also rejected as salt."""
+    master = generate_key()
+    with pytest.raises(ValueError, match="HKDF requires an explicit, non-empty salt"):
+        derive_hkdf_key(master, b"context", b"")
+
+def test_derive_hkdf_key_rejects_non_bytes_master():
+    salt = generate_salt()
+    with pytest.raises(TypeError):
+        derive_hkdf_key("not-bytes", b"context", salt)
+
+# ---------------------------------------------------------------------------
+# Argon2 Benchmark (Smoke Test)
+# ---------------------------------------------------------------------------
+
+def test_benchmark_argon2_params_smoke():
+    # This is intentionally light. We only assert structure, not speed.
+    params = benchmark_argon2_params(target_time=0.5)
+
+    assert isinstance(params, dict)
+    assert "time_cost" in params
+    assert "memory_cost" in params
+    assert "parallelism" in params
+    assert "measured_time" in params

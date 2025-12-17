@@ -81,8 +81,9 @@ class TOTPGenerator:
         try:
             totp = pyotp.TOTP(secret, interval=time_step)
             return totp.now()
-        except Exception:
-            return "000000"
+        except (TypeError, ValueError) as e:
+            raise ValueError("Invalid TOTP secret. Must be a valid Base32 string.") from e
+
 
     def get_time_remaining(self, time_step: int = 30) -> int:
         """

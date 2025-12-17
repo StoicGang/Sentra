@@ -7,7 +7,7 @@ import uuid
 from typing import Tuple, List, Dict
 
 from src.crypto_engine import (
-    encrypt_entry, decrypt_entry, compute_hmac, derive_hkdf_key, generate_salt
+    encrypt_entry, decrypt_entry, derive_hkdf_key, generate_salt
 )
 from src.database_manager import DatabaseManager
 
@@ -21,11 +21,25 @@ class BackupManager:
             hierarchy_keys: Optional dict of hierarchical keys.
         """
         self.db = db
+
+        if not isinstance(vault_keys, tuple) or len(vault_keys) != 2:
+            raise ValueError("vault_keys must be a tuple: (encryption_key, hmac_key)")
+        
         self.vault_keys = vault_keys
+        # Validate hierarchy keys schema early (fail fast)
+        if not isinstance(hierarchy_keys, dict):
+            raise ValueError("hierarchy_keys must be a dict")
+
+        vault_key = hierarchy_keys.get("vault_key")
+        if not isinstance(vault_key, (bytes, bytearray)) or len(vault_key) != 32:
+            raise ValueError(
+                "hierarchy_keys must contain 'vault_key' as 32-byte bytes"
+            )
+
         self.hierarchy_keys = hierarchy_keys
 
         enc_key, hmac_key = self.vault_keys
-        if enc_key == hmac_key:
+        if hmac.compare_digest(enc_key, hmac_key):
             raise ValueError(
                 "CRITICAL SECURITY ERROR: Encryption key and HMAC key must be different. "
                 "Check key derivation logic."
@@ -61,10 +75,13 @@ class BackupManager:
             encrypted_entries = []
             for entry in data:
                 if entry is None: continue
+                entry_copy = dict(entry)
+                entry_copy["password"] = entry_copy.get("password") or ""
+                entry_copy["notes"] = entry_copy.get("notes") or ""
 
                 # Canonical serialization
                 entry_json = json.dumps(
-                    entry, 
+                    entry_copy, 
                     sort_keys=True, 
                     separators=(",", ":"), 
                     ensure_ascii=False
@@ -86,7 +103,7 @@ class BackupManager:
             
             # A. Header
             header_dict = {
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "version": 1,
                 "entry_count": len(encrypted_entries),
                 "backup_id": str(uuid.uuid4())
@@ -238,22 +255,31 @@ class BackupManager:
                         category = entry_data.get("category", "General")
                         favorite_flag = 1 if entry_data.get("favorite") else 0
                         password_strength = int(entry_data.get("password_strength", 0))
-                        password_age_days = int(entry_data.get("password_age_days", 0))
 
                         # Derive per-entry key for *internal* vault storage
                         entry_salt = generate_salt(16)  # bytes
                         internal_entry_key = derive_hkdf_key(
                             master_key=internal_vault_key,
-                            info=entry_id.encode('utf-8'),
+                            info=b"entry-key-" + entry_id.encode("utf-8"),
                             salt=entry_salt
                         )
 
                         # Re-encrypt password and notes under internal_entry_key
-                        pw_plain = json.dumps({"password": entry_data.get("password", "")})
-                        notes_plain = json.dumps({"notes": entry_data.get("notes", "")})
+                        password_val = entry_data.get("password")
+                        notes_val = entry_data.get("notes")
 
-                        pw_c, pw_n, pw_t = encrypt_entry(plaintext=pw_plain, key=internal_entry_key)
-                        nt_c, nt_n, nt_t = encrypt_entry(plaintext=notes_plain, key=internal_entry_key)
+                        pw_plain = json.dumps({"password": password_val if isinstance(password_val, str) else ""})
+                        notes_plain = json.dumps({"notes": notes_val if isinstance(notes_val, str) else ""})
+
+                        pw_c, pw_n, pw_t = encrypt_entry(
+                            plaintext=pw_plain,
+                            key=internal_entry_key
+                        )
+
+                        nt_c, nt_n, nt_t = encrypt_entry(
+                            plaintext=notes_plain,
+                            key=internal_entry_key
+                        )
 
                         # Insert (or replace) into entries table
                         cursor.execute("""
@@ -262,9 +288,9 @@ class BackupManager:
                                 password_encrypted, password_nonce, password_tag,
                                 notes_encrypted, notes_nonce, notes_tag,
                                 tags, category, created_at, modified_at,
-                                favorite, password_strength, password_age_days,
+                                favorite, password_strength,
                                 is_deleted, deleted_at, kdf_salt
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             entry_id,
                             title,
@@ -273,7 +299,7 @@ class BackupManager:
                             pw_c, pw_n, pw_t,
                             nt_c, nt_n, nt_t,
                             tags, category, now_iso, now_iso,
-                            favorite_flag, password_strength, password_age_days,
+                            favorite_flag, password_strength,
                             0, None, entry_salt
                         ))
 
@@ -285,13 +311,11 @@ class BackupManager:
                 conn.commit()
 
                 # Optional: zero sensitive copies
-                try:
-                    if isinstance(internal_vault_key, bytearray):
-                        for i in range(len(internal_vault_key)):
-                            internal_vault_key[i] = 0
-                except Exception:
-                    pass
-
+                
+                if isinstance(internal_vault_key, bytearray):
+                    for i in range(len(internal_vault_key)):
+                        internal_vault_key[i] = 0
+        
                 return True
 
             except Exception as e:

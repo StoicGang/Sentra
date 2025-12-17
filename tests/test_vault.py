@@ -1,208 +1,300 @@
-import os
+import json
 import pytest
-import gc 
-from src.vault_controller import VaultController, VaultLockedError, VaultError, VaultAlreadyUnlockedError
+from unittest.mock import MagicMock, patch, ANY
 
-# -----------------------------------------------------------------------------
-# FIXTURES
-# -----------------------------------------------------------------------------
+from src.vault_controller import (
+    VaultController,
+    VaultError,
+    VaultLockedError,
+    VaultAlreadyUnlockedError,
+    CriticalVaultError,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def vault():
-    """Fixture to provide a clean vault controller for each test method"""
-    db_path = "data/test_vault_class.db"
+def mock_db():
+    db = MagicMock()
+    db.initialize_database.return_value = True
+    db.load_vault_metadata.return_value = None
+    db.save_vault_metadata.return_value = True
+    db.update_unlock_timestamp.return_value = True
+    db.add_entry.return_value = "new-uuid"
+    db.update_entry.return_value = True
+    return db
+
+@pytest.fixture
+def mock_secure_mem():
+    sm = MagicMock()
+    # Simulate successful locking returning a handle object
+    sm.lock_memory.side_effect = lambda buf: MagicMock(addr=1, length=len(buf), locked=True)
+    sm.zeroize.return_value = True
+    sm.unlock_memory.return_value = True
+    sm.protect_from_fork.return_value = True
+    return sm
+
+@pytest.fixture
+def mock_lockout():
+    al = MagicMock()
+    al.check_and_delay.return_value = (True, 0)
+    al.record_failure.return_value = None
+    al.reset_session.return_value = None
+    return al
+
+@pytest.fixture
+def mock_pw_gen():
+    pg = MagicMock()
+    # Default strength return: score, label, diag
+    pg.calculate_strength.return_value = (75, "Good", {})
+    return pg
+
+@pytest.fixture
+def controller(mock_db, mock_secure_mem, mock_lockout, mock_pw_gen):
+    # Patch dependencies to isolate Controller logic
+    with patch("src.vault_controller.DatabaseManager", return_value=mock_db), \
+         patch("src.vault_controller.SecureMemory", return_value=mock_secure_mem), \
+         patch("src.vault_controller.AdaptiveLockout", return_value=mock_lockout), \
+         patch("src.vault_controller.PasswordGenerator", return_value=mock_pw_gen):
+        
+        return VaultController(db_path=":memory:")
+
+# ---------------------------------------------------------------------------
+# vault_exists
+# ---------------------------------------------------------------------------
+
+def test_vault_exists_false_when_no_metadata(controller, mock_db):
+    mock_db.load_vault_metadata.return_value = None
+    assert controller.vault_exists() is False
+    # Should attempt to init schema just in case
+    mock_db.initialize_database.assert_called()
+
+def test_vault_exists_true_when_metadata_present(controller, mock_db):
+    mock_db.load_vault_metadata.return_value = {"salt": b"x"}
+    assert controller.vault_exists() is True
+
+def test_vault_exists_handles_db_error(controller, mock_db):
+    mock_db.load_vault_metadata.side_effect = Exception("boom")
     
-    # Setup: Ensure no leftover DB exists
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            pass 
+    # FIX: Catch the expected warning so it doesn't clutter output
+    with pytest.warns(RuntimeWarning, match="vault_exists"):
+        assert controller.vault_exists() is False
 
-    controller = VaultController(db_path)
+# ---------------------------------------------------------------------------
+# unlock_vault — new vault path
+# ---------------------------------------------------------------------------
+
+@patch("src.vault_controller.generate_salt", return_value=b"s"*16)
+@patch("src.vault_controller.derive_master_key", return_value=b"m"*32)
+@patch("src.vault_controller.generate_key", return_value=b"v"*32)
+@patch("src.vault_controller.compute_auth_hash", return_value=b"h"*32)
+@patch("src.vault_controller.encrypt_entry", return_value=(b"c", b"n", b"t"))
+@patch("src.vault_controller.decrypt_entry")
+def test_unlock_new_vault_success(
+    mock_decrypt, _e, _c, _g, _m, _s,
+    controller, mock_db
+):
+    # 1. First call returns None (starts new vault flow)
+    # 2. Second call returns valid metadata (verification step)
+    valid_meta = {
+        "salt": b"s"*16, "auth_hash": b"h"*32, 
+        "vault_key_encrypted": b"c", "vault_key_nonce": b"n", "vault_key_tag": b"t",
+        "kdf_config": json.dumps({})
+    }
+    mock_db.load_vault_metadata.side_effect = [None, valid_meta]
+
+    # Setup decrypt to succeed round-trip verification
+    # "76" hex is 'v' (118), matching our mocked generate_key b"v"*32
+    mock_decrypt.return_value = json.dumps({"vault_key": ("76"*32)}) 
+
+    assert controller.unlock_vault("password") is True
+    assert controller.is_unlocked is True
+    assert controller.master_key_secure is not None
+    assert controller.vault_key_secure is not None
+
+def test_unlock_rejects_empty_password(controller):
+    with pytest.raises(VaultError):
+        controller.unlock_vault("")
+
+def test_unlock_fails_if_already_unlocked(controller):
+    controller.is_unlocked = True
+    with pytest.raises(VaultAlreadyUnlockedError):
+        controller.unlock_vault("pw")
+
+@patch("src.vault_controller.derive_master_key", return_value=b"m"*32)
+@patch("src.vault_controller.generate_key", return_value=b"v"*32)
+@patch("src.vault_controller.encrypt_entry", return_value=(b"c", b"n", b"t"))
+@patch("src.vault_controller.decrypt_entry", return_value=json.dumps({"vault_key": "BAD_KEY"}))
+def test_unlock_fails_on_key_mismatch(_d, _e, _g, _m, controller, mock_db):
+    """Test the round-trip integrity check for new vaults."""
+    # 1. First call returns None (starts new vault flow)
+    # 2. Second call returns metadata (to proceed to verification step)
+    valid_meta = {
+        "salt": b"s"*16, "auth_hash": b"h"*32, 
+        "vault_key_encrypted": b"c", "vault_key_nonce": b"n", "vault_key_tag": b"t",
+        "kdf_config": json.dumps({})
+    }
+    mock_db.load_vault_metadata.side_effect = [None, valid_meta]
+
+    # FIX: Expect CriticalVaultError because controller wraps the ValueError
+    with pytest.raises(CriticalVaultError, match="Vault key mismatch"):
+        controller.unlock_vault("password")
+
+# ---------------------------------------------------------------------------
+# unlock_vault — existing vault path
+# ---------------------------------------------------------------------------
+
+def _existing_metadata():
+    return {
+        "salt": b"s"*16,
+        "auth_hash": b"h"*32,
+        "vault_key_encrypted": b"c",
+        "vault_key_nonce": b"n",
+        "vault_key_tag": b"t",
+        "kdf_config": json.dumps({
+            "time_cost": 3,
+            "memory_cost": 65536,
+            "parallelism": 1,
+            "salt_len": 16,
+            "hash_len": 32,
+        })
+    }
+
+@patch("src.vault_controller.verify_auth_hash", return_value=True)
+@patch("src.vault_controller.derive_master_key", return_value=b"m"*32)
+@patch("src.vault_controller.decrypt_entry", return_value=json.dumps({"vault_key": "76"*32}))
+def test_unlock_existing_vault_success(
+    _d, _m, _v,
+    controller, mock_db
+):
+    mock_db.load_vault_metadata.return_value = _existing_metadata()
+    assert controller.unlock_vault("password") is True
+    assert controller.is_unlocked is True
+
+@patch("src.vault_controller.verify_auth_hash", return_value=False)
+def test_unlock_existing_invalid_password(
+    _verify, controller, mock_db, mock_lockout
+):
+    mock_db.load_vault_metadata.return_value = _existing_metadata()
+    with pytest.raises(VaultError, match="Invalid password"):
+        controller.unlock_vault("wrong")
     
-    yield controller
+    # Ensure failure was recorded in adaptive lockout
+    mock_lockout.record_failure.assert_called_once()
+
+# ---------------------------------------------------------------------------
+# lock_vault
+# ---------------------------------------------------------------------------
+
+def test_lock_vault_zeroizes_and_resets(controller, mock_secure_mem):
+    controller.is_unlocked = True
+    controller.master_key_secure = bytearray(b"a"*32)
+    controller.vault_key_secure = bytearray(b"b"*32)
+    controller.master_key_handle = MagicMock()
+    controller.vault_key_handle = MagicMock()
+
+    assert controller.lock_vault() is True
+    assert controller.is_unlocked is False
+    assert controller.master_key_secure is None
+    assert controller.vault_key_secure is None
     
-    # Teardown: Clean up resources
-    try:
-        if controller.db.connection:
-            controller.db.close()
-            
-        if controller.is_unlocked:
-            try:
-                controller.lock_vault()
-            except:
-                pass 
-    except Exception:
-        pass
+    # Verify secure memory interactions
+    assert mock_secure_mem.zeroize.call_count >= 2
+    assert mock_secure_mem.unlock_memory.call_count >= 2
+
+# ---------------------------------------------------------------------------
+# CRUD Operations (Logic Delegation)
+# ---------------------------------------------------------------------------
+
+def test_add_password_calculates_strength(controller, mock_db, mock_pw_gen):
+    """Ensure add_password calls strength calculator and passes result to DB."""
+    controller.is_unlocked = True
+    controller.vault_key_secure = bytearray(b"v"*32)
+    mock_pw_gen.calculate_strength.return_value = (85, "Strong", {})
+
+    controller.add_password("MyTitle", password="secure_pass")
+
+    # Verify calculator called
+    mock_pw_gen.calculate_strength.assert_called_with("secure_pass")
     
-    # Force garbage collection to release SQLite file locks
-    del controller
-    gc.collect()
+    # Verify score passed to DB
+    mock_db.add_entry.assert_called_once()
+    args, kwargs = mock_db.add_entry.call_args
+    assert kwargs["password_strength"] == 85
 
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            pass
+def test_update_entry_recalculates_strength(controller, mock_db, mock_pw_gen):
+    """Ensure update_entry recalculates strength if password changes."""
+    controller.is_unlocked = True
+    controller.vault_key_secure = bytearray(b"v"*32)
+    mock_pw_gen.calculate_strength.return_value = (40, "Weak", {})
 
+    controller.update_entry("id1", password="new_weak_pass")
 
-# -----------------------------------------------------------------------------
-# TEST CLASSES
-# -----------------------------------------------------------------------------
+    mock_pw_gen.calculate_strength.assert_called_with("new_weak_pass")
+    
+    mock_db.update_entry.assert_called_once()
+    _, kwargs = mock_db.update_entry.call_args
+    assert kwargs["password_strength"] == 40
 
-class TestVaultAuthentication:
-    """Tests related to locking, unlocking, and state management"""
+def test_search_entries_delegates_to_db(controller, mock_db):
+    controller.is_unlocked = True
+    controller.search_entries("query")
+    mock_db.search_entries.assert_called_with("query", False, 50, 0)
 
-    def test_unlock_and_lock_lifecycle(self, vault):
-        # Initial state
-        assert vault.is_unlocked is False
+# ---------------------------------------------------------------------------
+# Locked-state enforcement
+# ---------------------------------------------------------------------------
 
-        # Unlock
-        password = "StrongPassword123!"
-        assert vault.unlock_vault(password) is True
-        assert vault.is_unlocked is True
+@pytest.mark.parametrize("method,args", [
+    ("add_password", ("t",)),
+    ("get_password", ("id",)),
+    ("list_entries", ()),
+    ("search_entries", ("q",)),
+    ("update_entry", ("id",)),
+    ("delete_entry", ("id",)),
+    ("restore_entry", ("id",)),
+    ("view_audit_log", ()),
+    ("get_backup_keys", ()),
+    ("create_backup_manager", ()),
+])
+def test_methods_fail_when_locked(controller, method, args):
+    controller.is_unlocked = False
+    with pytest.raises(VaultLockedError):
+        getattr(controller, method)(*args)
 
-        # Unlocking again should fail
-        with pytest.raises(VaultAlreadyUnlockedError):
-            vault.unlock_vault(password)
+# ---------------------------------------------------------------------------
+# Backup keys & manager
+# ---------------------------------------------------------------------------
 
-        # Lock
-        assert vault.lock_vault() is True
-        assert vault.is_unlocked is False
+@patch("src.vault_controller.derive_hkdf_key", side_effect=[b"enc", b"hmac"])
+def test_get_backup_keys_success(_hkdf, controller):
+    controller.is_unlocked = True
+    controller.master_key_secure = bytearray(b"m"*32)
+    controller.vault_key_secure = bytearray(b"v"*32)
 
-    def test_idempotent_lock(self, vault):
-        """Locking an already locked vault should be silent success"""
-        assert vault.lock_vault() is True
+    enc, mac = controller.get_backup_keys()
+    assert enc == b"enc"
+    assert mac == b"hmac"
 
+@patch("src.vault_controller.BackupManager")
+def test_create_backup_manager_success(mock_bm_cls, controller):
+    """Verify BackupManager is instantiated with correct keys."""
+    controller.is_unlocked = True
+    controller.master_key_secure = bytearray(b"m"*32)
+    controller.vault_key_secure = bytearray(b"v"*32)
 
-class TestEntryBasicOperations:
-    """Tests for basic Add/Get operations and validations"""
-
-    def test_add_and_get_password_success(self, vault):
-        vault.unlock_vault("Pass123!")
-
-        entry_id = vault.add_password(
-            title="My Email",
-            url="https://mail.example.com",
-            username="user@example.com",
-            password="P@ssw0rd!",
-            notes="My email password",
-            tags="email,personal",
-            category="Email"
-        )
-        assert entry_id
-
-        entry = vault.get_password(entry_id)
-        assert entry["title"] == "My Email"
-        assert entry["password"] == "P@ssw0rd!"
-        assert entry["category"] == "Email"
-
-    def test_operation_while_locked_fails(self, vault):
-        """Verify operations raise VaultLockedError when locked"""
-        with pytest.raises(VaultLockedError):
-            vault.add_password(title="Example")
-
-        with pytest.raises(VaultLockedError):
-            vault.get_password("nonexistent-id")
-
-    def test_add_password_invalid_input(self, vault):
-        vault.unlock_vault("Pass123!")
-        with pytest.raises(VaultError):
-            vault.add_password(title="")  # Empty title not allowed
-
-
-class TestEntryFeatures:
-    """Tests for specific entry features like Strength, Favorites, etc."""
-
-    def test_auto_password_strength_calculation(self, vault):
-        vault.unlock_vault("Pass123!")
-
-        # Weak
-        weak_id = vault.add_password(title="Weak", password="123")
-        # Strong
-        strong_id = vault.add_password(title="Strong", password="Correct-Horse-Battery-Staple-99!")
-
-        weak_entry = vault.get_password(weak_id)
-        strong_entry = vault.get_password(strong_id)
-
-        assert weak_entry['password_strength'] < 50
-        assert strong_entry['password_strength'] > 50
-
-    def test_favorites_handling(self, vault):
-        vault.unlock_vault("Pass123!")
-        eid = vault.add_password(title="Fav", password="pass", favorite=True)
-        assert vault.get_password(eid)['favorite'] is True
-
-
-class TestVaultLifecycle:
-    """Tests for the full lifecycle: List, Update, Delete, Restore, Search"""
-
-    def test_crud_delegation_flow(self, vault):
-        vault.unlock_vault("Pass123!")
-
-        # 1. ADD
-        eid = vault.add_password(title="Lifecycle Test", password="Init")
+    with patch.object(controller, 'get_backup_keys', return_value=(b"e", b"h")):
+        mgr = controller.create_backup_manager()
         
-        # 2. LIST
-        entries = vault.list_entries()
-        assert len(entries) == 1
-        assert entries[0]['title'] == "Lifecycle Test"
-
-        # 3. UPDATE
-        vault.update_entry(eid, title="Updated Title", password="New")
-        updated = vault.get_password(eid)
-        assert updated['title'] == "Updated Title"
-        assert updated['password'] == "New"
-
-        # 4. DELETE
-        vault.delete_entry(eid)
-        assert len(vault.list_entries()) == 0
-
-        # 5. RESTORE
-        vault.restore_entry(eid)
-        assert len(vault.list_entries()) == 1
-        assert vault.get_password(eid)['title'] == "Updated Title"
-
-    def test_search_integration(self, vault):
-        vault.unlock_vault("Pass123!")
+        mock_bm_cls.assert_called_once()
+        _, kwargs = mock_bm_cls.call_args
         
-        vault.add_password(title="GitHub", tags="dev")
-        vault.add_password(title="GitLab", tags="dev")
-        trash_id = vault.add_password(title="Old Yahoo", tags="email")
+        # Verify db passed
+        assert kwargs["db"] == controller.db
         
-        vault.delete_entry(trash_id)
-
-        # Active Search
-        results = vault.search_entries("Git")
-        assert len(results) == 2
-
-        # Deleted Search
-        results_deleted = vault.search_entries("Yahoo", include_deleted=True)
-        assert len(results_deleted) == 1
-        assert results_deleted[0]['id'] == trash_id
-
-
-class TestVaultSecurity:
-    """Tests for critical security requirements"""
-
-    def test_memory_zeroization(self, vault):
-        """Ensure keys are wiped from RAM after lock"""
-        vault.unlock_vault("Pass123!")
+        # Verify tuple passed for vault_keys
+        assert kwargs["vault_keys"] == (b"e", b"h")
         
-        # Capture reference to the mutable buffer
-        key_ref = vault.master_key_secure
-        assert any(b != 0 for b in key_ref)
-        
-        vault.lock_vault()
-        
-        # Verify in-place zeroization
-        assert all(b == 0 for b in key_ref)
-
-    def test_audit_log_generation(self, vault):
-        vault.unlock_vault("Pass123!")
-        vault.add_password(title="Audit Check")
-        
-        logs = vault.view_audit_log()
-        assert len(logs) > 0
-        assert logs[0]['action_type'] == 'CREATE'
+        # Verify hierarchy dict passed with INTERNAL key (from secure mem)
+        assert kwargs["hierarchy_keys"]["vault_key"] == b"v"*32

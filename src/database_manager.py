@@ -60,9 +60,18 @@ class DatabaseManager:
         """
         self.db_path = db_path
         self.connection: Optional[sqlite3.Connection] = None
-
         # Ensure data directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        directory = os.path.dirname(self.db_path)
+        try:
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+            # Attempt a write test to ensure permissions
+            test_path = os.path.join(directory, ".sentra_write_test")
+            with open(test_path, "w") as f:
+                f.write("ok")
+            os.remove(test_path)
+        except Exception as e:
+            raise RuntimeError(f"Database directory is not writable: {directory}") from e
     
     def connect(self) -> sqlite3.Connection:
         """ 
@@ -73,12 +82,19 @@ class DatabaseManager:
         """
         if self.connection is None:
             self.connection = sqlite3.connect(self.db_path)
-            self.connection.row_factory  = sqlite3.Row  # Dict-like rows
+            self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys = ON")
-            self.connection.execute("PRAGMA journal_mode = WAL") # Better concurency
-        
+
+            # Try WAL mode directly on the main connection
+            res = self.connection.execute("PRAGMA journal_mode=WAL;").fetchone()
+            actual_mode = res[0] if res else None
+
+            if actual_mode != "wal":
+                print("Warning: WAL mode unsupported, using DELETE journal mode.")
+                self.connection.execute("PRAGMA journal_mode=DELETE;")
+
         return self.connection
-    
+
     def close(self):
         """
         close the database connection
@@ -192,33 +208,19 @@ class DatabaseManager:
         """
         try:
             conn = self.connect()
-            
-            # Check if main table exists
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='vault_metadata'"
-            )
-            already_init = cursor.fetchone() is not None
-            
-            if not already_init:
-                # Read and execute schema
-                with open(SCHEMA_PATH, 'r') as f:
-                    schema_sql = f.read()
-                conn.executescript(schema_sql)
 
-            # FIX: Create dedicated table for Adaptive Lockout (Bug #13)
-            # This ensures concurrency safety across processes, unlike the JSON-in-metadata approach.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS lockout_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL  -- Unix timestamp
-                )
-            """)
+            # Always load the full schema atomically
+            with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+                schema_sql = f.read()
 
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.executescript(schema_sql)   # Schema already includes lockout_attempts
             conn.commit()
             return True
-            
-        except (IOError, sqlite3.Error) as e:
-            raise DatabaseError(f"Critical: Database initialization failed: {e}")
+
+        except Exception as e:
+            conn.rollback()
+            raise DatabaseError(f"Critical: Database initialization failed: {e}") from e
     
     def save_vault_metadata(
             self,
@@ -263,20 +265,27 @@ class DatabaseManager:
                     kdf_config,
                     created_at, version,
                     unlock_count, last_unlocked_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, '2.0', 0, NULL)
-            """, (salt, auth_hash, vault_key_encrypted, vault_key_nonce,
-                  vault_key_tag, kdf_json, datetime.now().isoformat()))
+                ) VALUES (
+                    1, ?, ?, ?, ?, ?, ?, 
+                    datetime('now'),    -- Use SQLite timestamp
+                    '2.0', 
+                    0, NULL
+                )
+            """, (
+                salt, auth_hash,
+                vault_key_encrypted, vault_key_nonce, vault_key_tag,
+                kdf_json
+            ))
             
             conn.commit()
             return True
 
-        except sqlite3.IntegrityError: 
-            # This catches the race condition
-            return False
-            
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to save metadata: {e}")
-        
+        except sqlite3.IntegrityError as e:
+            raise DatabaseError(f"Vault metadata already exists or schema violation: {e}") from e
+        except Exception as e:
+            conn.rollback() 
+            raise DatabaseError(f"Failed to save vault metadata: {e}") from e
+    
     def delete_vault_metadata(self) -> None:
         """
         Emergency rollback: delete vault metadata if initialization verification fails.
@@ -288,7 +297,8 @@ class DatabaseManager:
             conn.commit()
         except Exception as e:
             # If rollback fails, we are in a bad state, but must try
-            warnings.warn(f"Failed to rollback vault metadata: {e}")
+            conn.rollback()
+            raise DatabaseError(f"Critical failure: unable to rollback vault metadata: {e}") from e
         
     def load_vault_metadata(self) -> Optional[Dict]:
         """
@@ -341,16 +351,6 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
-        # TODO: Implement unlock timestamp update
-        # HINTS:
-        # 1. Get current timestamp: datetime.now().isoformat()
-        # 2. UPDATE vault_metadata SET 
-        #     last_unlocked_at = ?, 
-        #     unlock_count = unlock_count + 1
-        # WHERE id = 1
-        # 3. Check if rowcount > 0 (row was updated)
-        # 4. Commit transaction
-        # 5. Return True if updated, False otherwise
         conn = self.connect()
         timestamp = datetime.now().isoformat()
 
@@ -361,6 +361,9 @@ class DatabaseManager:
         """, (timestamp,))
 
         conn.commit()
+
+        if cursor.rowcount == 0:
+            raise DatabaseError("Vault metadata missing during unlock timestamp update")
 
         return cursor.rowcount > 0 # True if row was updated
     
@@ -427,9 +430,6 @@ class DatabaseManager:
             notes_payload = {"notes": notes or ""}
             notes_cipher, notes_nonce, notes_tag = encrypt_entry(json.dumps(notes_payload), entry_key)
             
-            # Timestamp
-            now = datetime.now(timezone.utc).isoformat()
-            
             # Insert into entries
             conn = self.connect()
             conn.execute("""
@@ -439,14 +439,14 @@ class DatabaseManager:
                     notes_encrypted, notes_nonce, notes_tag,
                     kdf_salt,
                     tags, category, created_at, modified_at,
-                    favorite, password_strength, password_age_days
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    favorite, password_strength
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?)
             """, (
                 entry_id, title, url, username,
                 pw_cipher, pw_nonce, pw_tag,          
                 notes_cipher, notes_nonce, notes_tag, 
                 entry_salt,
-                tags, category, now, now,
+                tags, category, 
                 1 if favorite else 0,   
                 password_strength
             ))
@@ -464,7 +464,7 @@ class DatabaseManager:
     
     def get_entry(self, entry_id: str, vault_key: bytes) -> Optional[Dict]:
         """ 
-        Retriev and decrypt entry by ID
+        Retrive and decrypt entry by ID
         
         Args:
             - entry_id: Entry UUID
@@ -529,7 +529,6 @@ class DatabaseManager:
                 password_dict = json.loads(password_data)
                 password = password_dict.get("password")
             except Exception as e:
-                password = None
                 raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}. Data may be tampered or corrupt.")
                 
             # Decrypt notes field
@@ -546,18 +545,15 @@ class DatabaseManager:
                 notes = None
                 raise DatabaseError(f"CRITICAL: Notes decryption failed for {entry_id}.")
             
-            # Update last accessed timestamp
-            now = datetime.now(timezone.utc).isoformat()
             try:
-                conn.execute(
-                    "UPDATE entries SET last_accessed_at = ? WHERE id = ?",
-                    (now, entry_id)
-                )
-                conn.commit()
-            except sqlite3.OperationalError as e:
-                pass
-            
-            modified_date = datetime.fromisoformat(row["modified_at"])
+                modified_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                modified_date = datetime.fromisoformat(row["modified_at"])
+
+            # 🔑 NORMALIZE TIMEZONE (THIS IS THE FIX)
+            if modified_date.tzinfo is None:
+                modified_date = modified_date.replace(tzinfo=timezone.utc)
+
             age_days = (datetime.now(timezone.utc) - modified_date).days
 
             # Return combined dict
@@ -573,7 +569,7 @@ class DatabaseManager:
                 "password_age_days": age_days,
                 "created_at": row["created_at"],
                 "modified_at": row["modified_at"],
-                "last_accessed_at": now,
+                "last_accessed_at": row["last_accessed_at"],
                 "password": password,
                 "notes": notes,
             }
@@ -640,7 +636,7 @@ class DatabaseManager:
             row = cursor.fetchone()
             
             if row is None:
-                return False  # Entry not found
+                return (False, 0)  # Entry not found
             
             current_salt = row['kdf_salt']
             
@@ -673,8 +669,11 @@ class DatabaseManager:
                 values.append(1 if favorite else 0)
 
             if password_strength is not None:
+                if not isinstance(password_strength, int) or not (0 <= password_strength <= 100):
+                    raise ValueError("password_strength must be integer between 0 and 100")
                 fields.append("password_strength = ?")
                 values.append(password_strength)
+
             
             # If password or notes changed, re-encrypt
             if password is not None or notes is not None:
@@ -686,7 +685,6 @@ class DatabaseManager:
                     ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
                     fields.extend(["password_encrypted = ?", "password_nonce = ?", "password_tag = ?"])
                     values.extend([ciphertext, nonce, tag])
-                    fields.append("password_age_days = 0")
                 
                 if notes is not None:
                     payload = {"notes": notes}
@@ -697,32 +695,34 @@ class DatabaseManager:
             
             # If no fields to update, return False (indicates nothing happened)
             if not fields:
-                return False
+                return (False, 0)
             
             # Always update modified_at
-            now = datetime.now(timezone.utc).isoformat()
-            fields.append("modified_at = ?")
-            values.append(now)
+            fields.append("modified_at = datetime('now')")
             
             # Build SQL correctly
             set_clause = ", ".join(fields)
             sql = f"UPDATE entries SET {set_clause} WHERE id = ?"
             values.append(entry_id)
 
-            # Execute
-            conn.execute(sql, tuple(values))
+            # Ensure we hold a write lock to avoid race conditions
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(sql, tuple(values))
+            rows = cur.rowcount if hasattr(cur, "rowcount") else conn.total_changes
             conn.commit()
-            
-            return True
+            return (True, rows)
             
         except ValueError as e:
             raise DatabaseError(f"Invalid input: {str(e)}")
         except sqlite3.IntegrityError as e:
+            conn.rollback()
             raise DatabaseError(f"Update violates constraints: {str(e)}")
         except sqlite3.OperationalError as e:
+            conn.rollback()
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
-            raise DatabaseError(f"Unexpected error updating entry: {str(e)}")
+            conn.rollback()
+            raise DatabaseError(f"Unexpected error updating entry: {str(e)}") from e
 
     def delete_entry(self, entry_id: str) -> bool:
         """
@@ -744,25 +744,31 @@ class DatabaseManager:
                 raise ValueError("Entry ID must be a non-empty string")
             
             conn = self.connect()
-            
-            deleted_at = datetime.now(timezone.utc).isoformat()
-            
+
+            # Begin write transaction
+            conn.execute("BEGIN IMMEDIATE;")
+
             cursor = conn.execute(
-                "UPDATE entries SET is_deleted = 1, deleted_at = ? WHERE id = ? AND is_deleted = 0",
-                (deleted_at, entry_id)
+                "UPDATE entries "
+                "SET is_deleted = 1, deleted_at = datetime('now') "
+                "WHERE id = ? AND is_deleted = 0",
+                (entry_id,)
             )
             
             if cursor.rowcount > 0:
                 conn.commit()
                 return True
             else:
+                conn.rollback()
                 return False  # Entry not found or already deleted
                 
         except ValueError as e:
             raise DatabaseError(f"Invalid input: {str(e)}")
         except sqlite3.OperationalError as e:
+            conn.rollback()
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
+            conn.rollback()
             raise DatabaseError(f"Unexpected error deleting entry: {str(e)}")
 
     def list_entries(
@@ -783,6 +789,13 @@ class DatabaseManager:
         try:
             conn = self.connect()
             
+            if limit > 1000:
+                raise ValueError("Limit exceeds maximum allowed (1000)")
+            if limit < 1:
+                limit = 1
+            if offset < 0:
+                offset = 0
+
             if include_deleted:
                 sql = """
                     SELECT id, title, url, username, tags, category, created_at, modified_at, is_deleted, deleted_at
@@ -802,8 +815,6 @@ class DatabaseManager:
             # Pass limit/offset safely as parameters
             cursor = conn.execute(sql, (limit, offset))
             return [dict(row) for row in cursor.fetchall()]
-            
-            return entries
             
         except sqlite3.OperationalError as e:
             raise DatabaseError(f"Database query failed: {str(e)}")
@@ -829,10 +840,17 @@ class DatabaseManager:
             
             conn = self.connect()
             
-            now = datetime.now(timezone.utc).isoformat()
-            
+            conn.execute("BEGIN IMMEDIATE;")
+
             cursor = conn.execute(
-                "UPDATE entries SET is_deleted = 0, deleted_at = NULL WHERE id = ? AND is_deleted = 1",
+                """
+                UPDATE entries
+                SET 
+                    is_deleted = 0,
+                    deleted_at = NULL,
+                    modified_at = datetime('now')   -- keep schema timestamp consistency
+                WHERE id = ? AND is_deleted = 1
+                """,
                 (entry_id,)
             )
             
@@ -840,13 +858,16 @@ class DatabaseManager:
                 conn.commit()
                 return True
             else:
+                conn.rollback()
                 return False  # Entry not found in trash
                 
         except ValueError as e:
             raise DatabaseError(f"Invalid input: {str(e)}")
         except sqlite3.OperationalError as e:
+            conn.rollback()
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
+            conn.rollback()
             raise DatabaseError(f"Unexpected error restoring entry: {str(e)}")
 
     def get_metadata(self, key: str) -> Optional[str]:
@@ -860,9 +881,11 @@ class DatabaseManager:
                 "SELECT value FROM metadata WHERE key = ?",
                 (key,)
             ).fetchone()
-            return row["value"] if row else None
-        except Exception:
-            return None
+            if row is None:
+                return None
+            return json.loads(row["value"])
+        except Exception as e:
+            raise DatabaseError(f"Failed to read metadata[{key}]: {e}") from e
 
     def update_metadata(self, key: str, value: str) -> bool:
         """
@@ -870,18 +893,21 @@ class DatabaseManager:
         """
         conn = self.connect()
         try:
+            json_value = json.dumps(value)
+            conn.execute("BEGIN IMMEDIATE;")
             conn.execute(
                 """
                 INSERT INTO metadata (key, value)
                 VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
-                (key, value)
+                (key, json_value)
             )
             conn.commit()
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            conn.rollback()
+            raise DatabaseError(f"Failed to update metadata[{key}]: {e}") from e
         
     def get_audit_logs(self, limit: int = 50) -> List[Dict]:
         """
@@ -912,18 +938,23 @@ class DatabaseManager:
             
             # SQL Logic: Find entries where 'modified_at' is older than threshold
             # This is fast, accurate, and read-only.
-            cursor = conn.execute(f"""
+            cursor = conn.execute("""
                 SELECT id, title, username, modified_at, password_strength
                 FROM entries 
-                WHERE modified_at < datetime('now', '-{int(days_threshold)} days')
+                WHERE modified_at < datetime('now', ?)
                 AND is_deleted = 0
                 ORDER BY modified_at ASC
-            """)
+            """, (f"-{days_threshold} days",))
+
             
             results = []
             for row in cursor.fetchall():
                 # Calculate exact age for display purposes
-                mod_date = datetime.fromisoformat(row["modified_at"])
+                try:
+                    mod_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    mod_date = datetime.fromisoformat(row["modified_at"])
+
                 age = (datetime.now(timezone.utc) - mod_date).days
                 
                 results.append({
@@ -966,12 +997,19 @@ class DatabaseManager:
         
         """
         try:
+            if limit > 1000:
+                raise ValueError("Limit exceeds maximum allowed (1000)")
+            if limit < 1:
+                limit = 1
+            if offset < 0:
+                offset = 0
+
             conn = self.connect()
             query = query.strip()
             if not query: return []
 
             # 1. VALIDATION
-            safe_token_pattern = re.compile(r'^[a-zA-Z0-9._-]{1,30}$')
+            safe_token_pattern = re.compile(r'^[A-Za-z0-9._-]{1,30}$')
             terms = query.split()
             
             # 2. DECISION: Prefer FTS, fallback to LIKE for symbols
@@ -984,6 +1022,9 @@ class DatabaseManager:
                 # If query has symbols, FTS tokenizers might choke/strip them.
                 # Fallback to LIKE to ensure we find "C++" or "user@email".
                 for term in terms:
+                    if not term.isascii():
+                        use_fts = False
+                        break
                     if not safe_token_pattern.match(term):
                         use_fts = False
                         break
@@ -1000,7 +1041,7 @@ class DatabaseManager:
                     FROM entries e
                     JOIN entries_fts f ON e.rowid = f.rowid
                     WHERE entries_fts MATCH ? AND e.is_deleted = 0
-                    ORDER BY rank
+                    ORDER BY bm25(entries_fts) ASC
                     LIMIT ? OFFSET ?
                 """
                 params = [fts_query, limit, offset]
@@ -1012,8 +1053,8 @@ class DatabaseManager:
                 
                 # Construct WHERE clauses as a list to prevent logic errors
                 where_clauses = [
-                    "(title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR "
-                    "username LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')"
+                    r"(title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR "
+                    r"username LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')"
                 ]
                 
                 # Explicitly add deletion filter if needed
@@ -1048,16 +1089,23 @@ class DatabaseManager:
             conn = self.connect()
             import time
             now = int(time.time())
+
+            conn.execute("BEGIN IMMEDIATE;")
             
             # 1. Insert new failure
-            conn.execute("INSERT INTO lockout_attempts (timestamp) VALUES (?)", (now,))
-            
+            conn.execute(
+                "INSERT INTO lockout_attempts (attempt_ts) VALUES (?)",
+                (now,)
+            )
             # 2. Prune old entries to prevent table bloat (keep last 1 hour)
-            conn.execute("DELETE FROM lockout_attempts WHERE timestamp < ?", (now - 3600,))
-            
+            conn.execute(
+            "DELETE FROM lockout_attempts WHERE attempt_ts < ?",
+                (now - 3600,)
+            )
             conn.commit()
         except Exception as e:
-            warnings.warn(f"Failed to record lockout failure: {e}")
+            conn.rollback()
+            raise DatabaseError(f"Failed to record lockout failure: {e}") from e
 
     def get_lockout_history(self, since_timestamp: int = 0) -> List[int]:
         """
@@ -1066,21 +1114,22 @@ class DatabaseManager:
         try:
             conn = self.connect()
             cursor = conn.execute(
-                "SELECT timestamp FROM lockout_attempts WHERE timestamp >= ? ORDER BY timestamp ASC",
+                "SELECT attempt_ts FROM lockout_attempts WHERE attempt_ts >= ? ORDER BY attempt_ts ASC",
                 (since_timestamp,)
             )
-            return [row["timestamp"] for row in cursor.fetchall()]
-        except Exception:
-            return []
+            return [row["attempt_ts"] for row in cursor.fetchall()]
+        except Exception as e:
+            raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
         
-    
     def clear_lockout_history(self) -> None:
         """
         Reset lockout history (e.g., after successful login or delay expiration).
         """
         try:
             conn = self.connect()
+            conn.execute("BEGIN IMMEDIATE;")
             conn.execute("DELETE FROM lockout_attempts")
             conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            conn.rollback()
+            raise DatabaseError(f"Failed to clear lockout history: {e}") from e

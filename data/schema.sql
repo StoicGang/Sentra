@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS vault_metadata (
     vault_key_tag BLOB NOT NULL,     
 
     -- Crypto Configuration (New in v2.0)
-    kdf_config TEXT,                        -- JSON string of KDF parameters (time_cost, memory_cost, etc.)       
+    kdf_config TEXT NOT NULL CHECK (json_valid(kdf_config)),      -- JSON string of KDF parameters (time_cost, memory_cost, etc.)       
     
     -- Metadata
     created_at TEXT NOT NULL,               -- ISO 8601
@@ -71,32 +71,37 @@ CREATE TABLE IF NOT EXISTS entries (
     deleted_at TEXT                         
 );
 
+CREATE INDEX IF NOT EXISTS idx_entries_category_active 
+ON entries(category, is_deleted);
+
+
 -- ============================================================================
 -- TABLE 3: failed_attempts_log (Brute-force protection)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS failed_attempts_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    attempt_timestamp TEXT NOT NULL,        
-    session_id TEXT,                        
+    attempt_timestamp INTEGER NOT NULL,     -- Unix epoch seconds
+    session_id TEXT,
     reason TEXT DEFAULT 'wrong_password',
-    ip_address TEXT                         -- Added for future remote sync capability
+    ip_address TEXT                         -- For future remote sync capability
 );
+
+CREATE TRIGGER IF NOT EXISTS prune_failed_attempts_log
+AFTER INSERT ON failed_attempts_log
+BEGIN
+    DELETE FROM failed_attempts_log
+    WHERE attempt_timestamp < CAST(strftime('%s','now','-30 days') AS INTEGER);
+END;
+
 
 -- ============================================================================
 -- TABLE 4: config_metadata (Key-Value Store for Adaptive Lockout/App Config)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,                    -- Stores JSON strings or scalars
+    value TEXT NOT NULL CHECK (json_valid(value)),                   -- Stores JSON strings or scalars
     updated_at TEXT DEFAULT (datetime('now'))
 );
-
--- Trigger to auto-update 'updated_at' on metadata change
-CREATE TRIGGER IF NOT EXISTS update_metadata_timestamp 
-AFTER UPDATE ON metadata 
-BEGIN
-    UPDATE metadata SET updated_at = datetime('now') WHERE key = new.key;
-END;
 
 -- ============================================================================
 -- TABLE 5: audit_log (New: Security Event Tracking)
@@ -110,6 +115,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
     FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp 
+ON audit_log(timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_entry_id
+ON audit_log(entry_id);
+
+
+
 -- ============================================================================
 -- TABLE 6: lockout_attempts (New: Adaptive Lockout Concurrency Safety)
 -- ============================================================================
@@ -117,18 +130,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- Uses INTEGER timestamps (Unix Epoch) for efficient math.
 CREATE TABLE IF NOT EXISTS lockout_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL
+    attempt_ts INTEGER NOT NULL
 );
+
+CREATE TRIGGER IF NOT EXISTS prune_lockout_attempts
+AFTER INSERT ON lockout_attempts
+BEGIN
+    DELETE FROM lockout_attempts
+    WHERE attempt_ts < CAST(strftime('%s','now','-1 hour') AS INTEGER);
+END;
+
 
 -- ============================================================================
 -- INDEXES (Performance)
 -- ============================================================================
 CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title);
-CREATE INDEX IF NOT EXISTS idx_entries_category ON entries(category);
 CREATE INDEX IF NOT EXISTS idx_entries_tags ON entries(tags);
+CREATE INDEX IF NOT EXISTS idx_entries_modified ON entries(modified_at);
 CREATE INDEX IF NOT EXISTS idx_entries_deleted ON entries(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_failed_attempts ON failed_attempts_log(attempt_timestamp);
-CREATE INDEX IF NOT EXISTS idx_lockout_timestamp ON lockout_attempts(timestamp);
+CREATE INDEX IF NOT EXISTS idx_lockout_attempts_ts ON lockout_attempts(attempt_ts);
 
 -- ============================================================================
 -- FULL-TEXT SEARCH (FTS5) - Synchronized with Soft Deletes

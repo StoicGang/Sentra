@@ -16,7 +16,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import hmac
 
-
+MIN_MEMORY_KB = 8 * 1024        # 8 MB
+MAX_MEMORY_KB = 1_048_576       # 1 GB hard cap
+PBKDF2_ITERATIONS = 600_000  # OWASP 2024 baseline
 
 """
 ==========================================================================
@@ -141,13 +143,15 @@ def derive_master_key(
         >>> len(master_key)
         32
     """
-    # TODO: Implement Argon2id key derivation
-    # HINTS:
-    # 1. Use argon2.low_level.hash_secret_raw()
-    # 2. Encode password to UTF-8 bytes
-    # 3. Specify Type.ID for Argon2id variant
-    # 4. Handle potential HashingError exceptions
-    
+        
+    if not isinstance(memory_cost, int):
+        raise ValueError("Argon2 memory_cost must be an integer")
+
+    if memory_cost < MIN_MEMORY_KB:
+        raise ValueError("Argon2 memory_cost too low (<8MB)")
+
+    if memory_cost > MAX_MEMORY_KB:
+        raise ValueError("Argon2 memory_cost exceeds safe limit (1GB)")
     try:
         password_bytes = password.encode("utf-8")
         raw_hash = low_level.hash_secret_raw(
@@ -160,6 +164,7 @@ def derive_master_key(
             type=low_level.Type.ID
         )
         return raw_hash
+    
     except HashingError as e:
         raise RuntimeError(f"Argon2id key derivation failed: {e}")
 
@@ -167,7 +172,7 @@ def derive_master_key(
 def compute_auth_hash(
         password: str, 
         salt: bytes, 
-        iterations: int = 100000
+        iterations: int = PBKDF2_ITERATIONS
 ) -> bytes:
     """
     Compute authentication hash for password verification. 
@@ -201,16 +206,15 @@ def compute_auth_hash(
         >>> auth_hash == compute_auth_hash("MySecurePass123!", salt)
         true
     """
-    # TODO: Implement PBKDF2-HMAC-SHA256 authentication hash
-    # HINTS:
-    # 1. Use hashlib.pbkdf2_hmac('sha256', ...)
-    # 2. password.encode('utf-8') for bytes
-    # 3. Return 32-byte hash (dklen=32)
+    context = b"sentra-auth-hash-v1"
 
     if isinstance(password, str):
         password_bytes = password.encode('utf-8')
     else:
         password_bytes = password
+    
+    password_bytes = context + password_bytes
+
     auth_hash = hashlib.pbkdf2_hmac(
         'sha256',   # Hash algorithm
         password_bytes,   # Password as bytes
@@ -263,49 +267,57 @@ def benchmark_argon2_params(
     test_password = "benchmark_test_password_123"
     test_salt = generate_salt()
 
-    # TODO: Implement benchmarking algorithm
-    # HINTS:
-    # 1. Start with memory_cost = min_memory_KB, time_cost = 2
-    # 2. Use time.time() to measure derivation time
-    # 3. Adjust memory_cost to approach target_time
-    # 4. Try a few iterations to find optimal parameters
+    cpu_cores = os.cpu_count() or 1
+    parallelism = min(parallelism, cpu_cores)
 
-    # Default template:
-    best_params = {
-        'time_cost': 2, 
-        'memory_cost': min_memory_kb,
-        'parallelism': parallelism, 
-        'measured_time': 0.0
-    }
 
     # benchmarking logic
-    memory_levels = [32768, 65536, 131072] # 32, 64, 128 MB
+    low = min_memory_kb
+    high = max_memory_kb
+    best = None
 
-    for memory in memory_levels:
-        start_time = time.time()
-        derive_master_key(test_password, test_salt,
-                          time_cost=3, 
-                          memory_cost=memory,
-                          parallelism=parallelism)
-        elapsed = time.time() - start_time
+    while low <= high:
+        mid = (low + high) // 2
+        start = time.time()
 
-        print(f"    Memory: {memory // 1024} MB -> Time: {elapsed:.2f}s")
+        try:
+            derive_master_key(
+                test_password,
+                test_salt,
+                time_cost=3,
+                memory_cost=mid,
+                parallelism=parallelism
+            )
+        except Exception:
+            # If system cannot handle this memory, back off
+            high = mid - 1
+            continue
 
-        if elapsed <= target_time and elapsed > best_params['measured_time']:
-            best_params = {
-                'time_cost': 3, 
-                'memory_cost': memory,
-                'parallelism': parallelism, 
-                'measured_time': elapsed
+        elapsed = time.time() - start
+
+        if elapsed <= target_time:
+            best = {
+                "time_cost": 3,
+                "memory_cost": mid,
+                "parallelism": parallelism,
+                "measured_time": elapsed
             }
+            # Try stronger parameters
+            low = mid + 1024
+        else:
+            # Too slow, reduce memory
+            high = mid - 1024
+
+    if best is None:
+        raise RuntimeError("Failed to benchmark Argon2 parameters on this device")
 
     print(f"\n✓ Optimal parameters found:")
-    print(f"   Time cost: {best_params['time_cost']}")
-    print(f"   Memory cost: {best_params['memory_cost']} KB ({best_params['memory_cost'] // 1024} MB)")
-    print(f"   Parallelism: {best_params['parallelism']}")
-    print(f"   Measured time: {best_params['measured_time']:.2f}s\n")
-    
-    return best_params
+    print(f"   Time cost: {best['time_cost']}")
+    print(f"   Memory cost: {best['memory_cost']} KB ({best['memory_cost'] // 1024} MB)")
+    print(f"   Parallelism: {best['parallelism']}")
+    print(f"   Measured time: {best['measured_time']:.2f}s\n")
+
+    return best
 
 """
 =============================================================================
@@ -407,8 +419,11 @@ def decrypt_entry(
         plaintext = plaintext_bytes.decode('utf-8')
         return plaintext
     
-    except InvalidTag:
-        raise InvalidTag("Entry data corrupted or tampered. Restore from backup.")
+    except InvalidTag as e:
+        raise InvalidTag(
+            "Authentication failed: wrong key or data corrupted"
+        ) from e
+
     except Exception as e:
         raise RuntimeError(f"Decryption failed: {e}")
 
@@ -460,12 +475,10 @@ def verify_auth_hash(stored_hash: bytes, password: str, salt: bytes) -> bool:
     computed = compute_auth_hash(password, salt)
     return hmac.compare_digest(computed, stored_hash)
 
-# ... existing code ...
-
 def derive_hkdf_key(
     master_key: bytes,
     info: bytes,
-    salt: bytes = None,
+    salt: bytes | None = None,
     length: int = 32
 ) -> bytes:
     """
@@ -483,6 +496,9 @@ def derive_hkdf_key(
     """
     if not isinstance(master_key, bytes):
         raise TypeError("Master key must be bytes")
+    
+    if not salt or not isinstance(salt, (bytes, bytearray)):
+        raise ValueError("HKDF requires an explicit, non-empty salt")
         
     hkdf = HKDF(
         algorithm=hashes.SHA256(),

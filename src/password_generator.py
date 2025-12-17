@@ -5,7 +5,7 @@ Generates high-entropy passwords with configurable length and character sets.
 Uses cryptographically secure randomness (secrets).
 """
 
-from typing import Dict, Tuple, Set, Optional
+from typing import Dict, Tuple, Set, Optional, List
 import string
 import re
 import secrets
@@ -57,6 +57,9 @@ class PasswordGenerator:
 
         self.common_passwords = set()
         self._load_dictionary(dict_path)
+        self.dictionary_loaded = False
+        self.dictionary_size = 0
+
 
     def _load_dictionary(self, path: str):
         """
@@ -70,6 +73,8 @@ class PasswordGenerator:
                 path = os.path.join(base_dir, path)
 
             if os.path.exists(path):
+                self.dictionary_loaded = True
+                self.dictionary_size = len(self.common_passwords)
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                     # Read lines, strip whitespace, and filter short ones
                     for line in f:
@@ -79,6 +84,8 @@ class PasswordGenerator:
                 print(f"Loaded {len(self.common_passwords)} common passwords from dictionary.")
             else:
                 # Silent fallback or warning
+                self.dictionary_loaded = False
+                self.dictionary_size = 0
                 pass
                 print(f"Warning: Password dictionary not found at {path}")
         except Exception:
@@ -142,7 +149,7 @@ class PasswordGenerator:
         if len(s2) == 0:
             return len(s1)
             
-        previous_row = range(len(s2) + 1)
+        previous_row = list(range(len(s2) + 1))
         for i, c1 in enumerate(s1):
             current_row = [i + 1]
             for j, c2 in enumerate(s2):
@@ -153,7 +160,7 @@ class PasswordGenerator:
             previous_row = current_row
         return previous_row[-1]
     
-    def calculate_strength(self, password:str, user_inputs: Optional[list[str]] = None) -> Tuple[int, str, Dict]:
+    def calculate_strength(self, password:str, user_inputs: Optional[List[str]] = None) -> Tuple[int, str, Dict]:
         """
         Evaluate password strength.
 
@@ -224,7 +231,7 @@ class PasswordGenerator:
              diagnostics.setdefault("weak_patterns", []).append("alternating_pattern")
 
         # F. Common Substitutions (Leet Speak)
-        subs = {'@': 'a', '0': 'o', '3': 'e', '1': 'i', '$': 's', '!': 'i'}
+        subs = {'@': 'a', '0': 'o', '3': 'e', '1': 'i', '$': 's', '!': 'i', '4': 'a'}
         normalized = lower_pw
         for char, repl in subs.items():
             normalized = normalized.replace(char, repl)

@@ -9,7 +9,7 @@ import argparse
 import getpass
 import sys
 import shlex
-import textwrap
+from datetime import datetime
 import os
 from typing import Optional, List, Dict
 from enum import Enum
@@ -713,7 +713,7 @@ class SentraCLI:
             
             self.vault.delete_entry(entry_id)
             print_success(f"Entry '{entry.get('title')}' moved to trash.")
-            print_info("Use 'sentra restore' to recover if needed.")
+            print_info("Use 'sentra recover' to recover if needed.")
         
         except Exception as e:
             print_error(f"Failed to delete entry: {e}")
@@ -1002,7 +1002,7 @@ class SentraCLI:
                 print(f"✓ {colors.success('Duplicate Usernames:')} 0")
             
             # Check 3: Missing 2FA
-            no_totp = len([e for e in entries if not e.get('tags', '').lower().__contains__('2fa')])
+            no_totp = len([e for e in entries if not (e.get('tags') or '').lower().__contains__('2fa')])
             print(f"ℹ️  {colors.info('Entries without 2FA tag:')} {no_totp}")
             
             print()
