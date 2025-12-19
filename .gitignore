@@ -20,6 +20,8 @@ build/
 data/vault.db
 data/backups/
 *.enc
+*.csv
+*.yaml
 *.db
 sentra_config.json
 
