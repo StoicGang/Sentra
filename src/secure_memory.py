@@ -8,18 +8,26 @@ Platform Support:
 - Graceful degradation if privileges insufficient
 """
 
-import os
 import sys
 import ctypes
 import warnings
-from typing import Optional, Tuple, Dict, Any
-from datetime import datetime, timezone
+from typing import Tuple, Union, Any, Optional, Dict
 import atexit
 
-# Platform detection constants
-IS_LINUX = sys.platform.startswith('linux')
-IS_WINDOWS = sys.platform == 'win32'
-IS_MACOS = sys.platform == 'darwin'
+def _detect_platform() -> str:
+    p = sys.platform.lower()
+    if p.startswith('linux'): return 'LINUX'
+    if p.startswith('win32') or p.startswith('cygwin'): return 'WINDOWS'
+    if p.startswith('darwin'): return 'MACOS'
+    return 'UNKNOWN'
+
+PLATFORM = _detect_platform()
+IS_LINUX = (PLATFORM == 'LINUX')
+IS_WINDOWS = (PLATFORM == 'WINDOWS')
+IS_MACOS = (PLATFORM == 'MACOS')
+
+FORMAT_MESSAGE_FROM_SYSTEM  = 0x00001000
+FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
 
 class SecureMemoryHandle:
     """
@@ -42,60 +50,44 @@ class MemoryLockError(SecureMemoryError):
 
 class SecureMemory:
     """
-    Cross-platform secure memory manager
-    
-    Features:
-    - Memory locking (prevents swap to disk)
-    - Secure zeroing (compiler-resistant)
-    - Fork protection (prevent child process inheritance)
-    - Automatic cleanup on exit
-    
-    Usage: 
-        sm = SecureMemory()
-        key = b"sensitive_master_key_32_bytes!!"
-        
-        # Lock memory
-        sm.lock_memory(key)
+        Cross-platform secure memory manager
 
-        # Use key...
-
-        # Securely erase
-        sm.zeroize(key)
-        sm.unlock_memory(key)
-
+        Features:
+        - Memory locking (prevents swap to disk)
+        - Secure zeroing (compiler-resistant)
+        - Fork protection (prevent child process inheritance)
+        - Automatic cleanup on exit
     """
+
     def __init__(self):
         """Initialize secure memory manager and detect platform capabilities"""
         self._handles: set[SecureMemoryHandle] = set()
+        self.libc: Any = None
+        self.kernel32: Any = None
         self._initialize_platform()
 
-        atexit.register(self.cleanup_all)
+        if PLATFORM == 'UNKNOWN':
+            warnings.warn(
+                "Secure Memory: Unsupported platform. Memory locking is DISABLED. "
+                "Sensitive keys may be swapped to disk.",
+                RuntimeWarning
+            )
+
+        atexit.register(self._cleanup_all_silent)
 
     def _initialize_platform(self):
         """
         Detect OS and load platform-specific system libraries
-        
-        TODO: Implement platform detection and library loading 
-        HINTS:
-        1. Check IS_LINUX, IS_WINDOWS, IS_MACOS flags
-        2. For Linux/macOS : load libc using ctypes.CDLL('libc.so.6') or ('libc.dylib
-        )
-        3. For Windows: Load kernel32 using ctypes.windll.kernel32
-        4. Store library refernces as instance variables
-        5. Set up function signatures (argtypes, restype)
-        
+
         Function Signatures Needed:
         Linux/macOS:
         - mlock(const void *addr, size_t len) -> int
         - munlock(const void *addr, size_t len) -> int
-        
+
         Windows:
         - VirtualLock(LPVOID lpAddress, SIZE_T dwSize) -> BOOL
         - VirtualUnlock(LPVOID lpAddress, SIZE_T dwSize) -> BOOL
         """
-        self.libc = None
-        self.kernel32 = None
-        
         try:
             if IS_LINUX:
                 self.libc = ctypes.CDLL('libc.so.6')
@@ -103,8 +95,11 @@ class SecureMemory:
                 self.libc.mlock.restype = ctypes.c_int
                 self.libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
                 self.libc.munlock.restype = ctypes.c_int
-                self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                self.libc.madvise.restype = ctypes.c_int
+                # madvise is optional but good for security
+                if hasattr(self.libc, 'madvise'):
+                    self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+                    self.libc.madvise.restype = ctypes.c_int
+                self.platform_supported = True
 
             elif IS_MACOS:
                 self.libc = ctypes.CDLL('libc.dylib')
@@ -112,187 +107,175 @@ class SecureMemory:
                 self.libc.mlock.restype = ctypes.c_int
                 self.libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
                 self.libc.munlock.restype = ctypes.c_int
+                self.platform_supported = True
 
             elif IS_WINDOWS:
+                # Use Any to suppress static analysis errors on non-Windows dev machines
                 self.kernel32 = ctypes.windll.kernel32
-                self.kernel32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                self.kernel32.VirtualLock.restype = ctypes.c_bool
-                self.kernel32.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                self.kernel32.VirtualUnlock.restype = ctypes.c_bool
+
+                # Dynamic attribute access to satisfy linters (cannot find reference 'VirtualLock')
+                virtual_lock = getattr(self.kernel32, 'VirtualLock')
+                virtual_lock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                virtual_lock.restype = ctypes.c_int  # BOOL is int
+
+                virtual_unlock = getattr(self.kernel32, 'VirtualUnlock')
+                virtual_unlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                virtual_unlock.restype = ctypes.c_int
+
+                self.platform_supported = True
+
+            else:
+                self.platform_supported = False
 
         except Exception as e:
+            self.platform_supported = False
             warnings.warn(f"SecureMemory init failed: {e}. Running in degraded mode.")
-    
-    def lock_memory(self, data: bytes) -> bool:
+
+    def lock_memory(self, data: Union[bytearray, memoryview]) -> Optional[SecureMemoryHandle]:
         """
         Lock memory region to prevent swapping to disk
-        
+
         Args:
             data: Bytes object to lock in memory
-            
+
         Returns:
             SecureMemoryHandle if locking attempted (even in degraded mode)
             None if input is invalid or length is zero
-                
+
         Security:
             - Prevents sensitive data from being written to disk
-            - Graceful degradation if privileges insufficient 
-            - Tracks locked regions for cleanup 
-            
-        Example:
-            >>> key = b"sensitive_master_key_32_bytes!!!"
-            >>> sm = SecureMemory()
-            >>> success = sm.lock_memory(key)
-            >>> if not success:
-            ....    print("Running in degraded mode - no mlock protection")    
+            - Graceful degradation if privileges insufficient
+            - Tracks locked regions for cleanup
         """
+        if not self.platform_supported:
+            pass
         try:
             addr, length, keeper = self._address_and_length(data)
         except Exception as e:
             warnings.warn(f"SecureMemory: unable to get buffer address: {e}")
             return None
-        
+
         if length == 0:
             return None
-        
+
         locked_ok = False
 
         # Attempt OS-level locking
         if IS_WINDOWS and self.kernel32 is not None:
-            ok = bool(self.kernel32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
-            locked_ok = ok
-        elif (IS_LINUX or IS_MACOS) and self.libc is not None and hasattr(self.libc, "mlock"):
-            rc = int(self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(length)))
-            locked_ok = (rc == 0)
-        else:
-            warnings.warn("SecureMemory: locking not supported; running in degraded mode.")
-            # We still return a handle so zeroize() can work later
-            locked_ok = False
+            try:
+                # VirtualLock returns non-zero on success
+                res = self.kernel32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(length))
+                locked_ok = bool(res)
+            except (OSError, AttributeError):
+                locked_ok = False
 
-        if not locked_ok and (IS_LINUX or IS_MACOS or IS_WINDOWS):
+        elif (IS_LINUX or IS_MACOS) and self.libc:
+            try:
+                # mlock returns 0 on success
+                rc = self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(length))
+                locked_ok = (rc == 0)
+            except (OSError, AttributeError):
+                locked_ok = False
+
+        if not locked_ok and self.platform_supported:
              warnings.warn(f"SecureMemory: memory lock attempt failed")
 
         # Create and register handle
         handle = SecureMemoryHandle(addr, length, keeper)
         handle.locked = locked_ok
         self._handles.add(handle)
-        
+
         return handle
-    
-    def _address_and_length(self, data: bytes) -> Tuple[int, int, object]:
+
+    @staticmethod
+    def _address_and_length(data: Union[bytearray, memoryview]) -> Tuple[int, int, Any]:
         """
         Get memory address and size of bytes object
-        
+
         Args:
             data: Bytes object
-        
+
         Returns:
             Tuple of (address, length)
         """
         if not isinstance(data, (bytes,bytearray, memoryview)):
-            raise TypeError("lock_memory expects bytes/bytearray/memoryview")
-        
+            raise TypeError("lock_memory expects bytearray or memoryview")
+
         if isinstance(data, bytes):
-            length = len(data)
-            # create a dedicated native buffer copy;
-            keeper = ctypes.create_string_buffer(data,length)
-            addr = ctypes.addressof(keeper)
-            return addr, length, keeper
-        
+            raise TypeError(
+                "secure_memory cannot lock immutable bytes objects. "
+                "Use bytearray or a writable memoryview."
+            )
+
         if isinstance(data, bytearray):
             mv = memoryview(data)
-            if not mv.contiguous:
-                raise ValueError("bytearray must be contiguous")
-            length = len(mv)
-            keeper = (ctypes.c_char * length).from_buffer(mv)
-            addr = ctypes.addressof(keeper)
-            return addr, length, keeper
-        
-        mv = data 
-        if not mv.contiguous:
-            raise ValueError("memoryview must be contiguous")
-        length = len(mv)
-        if mv.readonly:
-            keeper = (ctypes.c_char * length).from_buffer_copy(mv)
         else:
-            keeper = (ctypes.c_char * length).from_buffer(mv)
+            mv = data
+
+        if not mv.contiguous:
+            raise ValueError("Buffer must be contiguous")
+        if mv.readonly:
+            raise TypeError(
+                "secure_memory cannot lock readonly memoryview. "
+                "Provide a writable buffer."
+            )
+        length = len(mv)
+        keeper = (ctypes.c_char * length).from_buffer(mv)
         addr = ctypes.addressof(keeper)
+
         return addr, length, keeper
 
     def unlock_memory(self, handle: SecureMemoryHandle) -> bool:
-        """
-        Unlock memory region to allow normal paging
-        
-        Args:
-            data: Bytes object to unlock
-            
-        Returns:
-            True if successfully unlocked
-            False if unlock failed or region not tracked
-            
-        Security:
-            - Called when key is no longger needed
-            - Releases memory lock, allowing normal OS paging
-            - Does NOT erase the data (use zeroize() for that)
-            
-        Example:
-            >>> sm.unlock_memory(key)
-        """
         if not isinstance(handle, SecureMemoryHandle) or handle not in self._handles:
             return False
 
-        unlocked_ok = True 
-        
-        if handle.locked:
-            unlocked_ok = False
-            if IS_WINDOWS and self.kernel32 is not None:
+        if not handle.locked:
+            self._handles.discard(handle)
+            return True
+
+        unlocked_ok = True
+        try:
+            if IS_WINDOWS and self.kernel32:
                 ret = self.kernel32.VirtualUnlock(ctypes.c_void_p(handle.addr), ctypes.c_size_t(handle.length))
-                if ret:
-                    unlocked_ok = True
-                else:
+                if not ret:
+                    # Error 158 (already unlocked) or 487 (invalid addr) are "ok" during cleanup
                     err = ctypes.get_last_error()
-                    if err in (158, 487, 0): unlocked_ok = True
-            
-            elif (IS_LINUX or IS_MACOS) and self.libc is not None and hasattr(self.libc, "munlock"):
-                rc = int(self.libc.munlock(ctypes.c_void_p(handle.addr), ctypes.c_size_t(handle.length)))
-                unlocked_ok = (rc == 0)
+                    if err not in (158, 487, 0):
+                        unlocked_ok = False
+
+            elif (IS_LINUX or IS_MACOS) and self.libc:
+                rc = self.libc.munlock(ctypes.c_void_p(handle.addr), ctypes.c_size_t(handle.length))
+                if rc != 0:
+                    unlocked_ok = False
+
+        except Exception as e:
+            warnings.warn(f"SecureMemory: exception during unlock: {e}")
+            unlocked_ok = False
 
         if not unlocked_ok:
-            msg = self._get_last_error_message()
-            warnings.warn(f"SecureMemory: unlock failed: {msg}")
-            return False
+            warnings.warn(f"SecureMemory: unlock failed for handle at {handle.addr}")
 
-        # Unregister handle
+        # Unregister handle regardless of OS error to prevent handle leaks
         self._handles.discard(handle)
-        return True
-    
+        return unlocked_ok
+
     def _get_last_error_message(self) -> str:
         """
         Get human-readable error message from OS
-        
+
         Returns:
             Error message string
-        
+
         Platform-specific:
             - Linux/macOS: errno via ctypes.get_errno()
             - Windows: GetLastError() via kernel32
         """
-        # TODO: Implement error message retrieval
-        # HINTS:
-        # 1. On Windows: Use ctypes.GetLastError()
-        # 2. On Unix: Use ctypes.get_errno()
-        # 3. Common Windows errors:
-        #    - 5: ERROR_ACCESS_DENIED (no privileges)
-        #    - 8: ERROR_NOT_ENOUGH_MEMORY
-        # 4. Return formatted message with error code
         if IS_WINDOWS and self.kernel32 is not None:
             # Expand GetLastError using FormatMessageW
             err = ctypes.get_last_error()
             if not err:
                 return "No Error"
             buf = ctypes.create_unicode_buffer(1024)
-            FORMAT_MESSAGE_FROM_SYSTEM  = 0x00001000
-            FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
             size = self.kernel32.FormatMessageW(
                 FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                 None, err, 0, buf, len(buf), None
@@ -308,67 +291,38 @@ class SecureMemory:
         except Exception:
             pass
         return f"errno {err}" if err else "No Error"
-    
-    def zeroize(self, handle: SecureMemoryHandle) -> bool:
-        """
-        Securely erase sensitive data from memory
-        
-        Args:
-            data: Bytes/bytearray/memoryview to zero out
-        
-        Returns:
-            True if successfully zeroed
-            False if zeroing may have failed
-        
-        Security:
-            - Uses ctypes.memset (compiler-resistant)
-            - Zeroes the actual memory location
-            - Cannot prevent all copies (Python internals)
-            - Best effort: zeros the primary buffer
-        
-        Example:
-            >>> key = bytearray(b"sensitive_key_32_bytes_here!")
-            >>> sm.zeroize(key)
-            True
-            >>> key
-            bytearray(b'\x00\x00\x00\x00\x00\x00\x00\x00...')
-        """
+
+    @staticmethod
+    def zeroize( handle: SecureMemoryHandle) -> bool:
         if not isinstance(handle, SecureMemoryHandle):
+            return False
+
+        if not handle.addr or handle.length <= 0:
             return False
 
         try:
             ctypes.memset(handle.addr, 0, handle.length)
-            
-            # Verify
-            if handle.length > 0:
-                first_byte = ctypes.cast(handle.addr, ctypes.POINTER(ctypes.c_ubyte))[0]
-                if first_byte != 0:
-                    warnings.warn("Zeroing Verification failed")
+
+            if handle.keeper:
+                # Cast keeper to byte array for checking
+                # We use the keeper directly rather than raw address pointer
+                verified = True
+                for i in range(handle.length):
+                    if handle.keeper[i] != b'\x00':
+                        verified = False
+                        break
+
+                if not verified:
+                    warnings.warn("SecureMemory: zeroization verification failed!")
                     return False
+
             return True
+
         except Exception as e:
             warnings.warn(f"SecureMemory: zeroize failed: {e}")
             return False
-        
+
     def protect_from_fork(self, data_or_handle) -> bool:
-        """
-         Prevent memory region from being copied to child processes on fork
-    
-        Args:
-            data: Bytes object to protect
-        
-        Returns:
-            True if protection applied
-            False if not supported or failed
-        
-        Security:
-            - Uses madvise(MADV_DONTFORK) on Unix
-            - Prevents child processes from inheriting sensitive memory
-            - Windows: Not applicable (no fork semantics)
-        
-        Example:
-            >>> sm.protect_from_fork(master_key)
-        """
 
         # Windows: No fork model, nothing to do
         if IS_WINDOWS:
@@ -379,36 +333,35 @@ class SecureMemory:
 
         try:
             # 1. Preferred: Handle
-            if hasattr(data_or_handle, "addr") and hasattr(data_or_handle, "length"):
+            if isinstance(data_or_handle, SecureMemoryHandle):
                 addr = data_or_handle.addr
                 length = data_or_handle.length
-            
-            # 2. Backwards-compat: Raw buffer (Only safe for mutable types like bytearray)
+            elif hasattr(data_or_handle, "addr") and hasattr(data_or_handle, "length"):
+                # Duck typing for handle-like objects
+                addr = data_or_handle.addr
+                length = data_or_handle.length
             else:
+                # 2. Raw buffer (less safe, creates temporary handle)
                 if isinstance(data_or_handle, bytes):
-                    warnings.warn("SecureMemory: protect_from_fork called on immutable 'bytes'. "
-                                  "This protects a temporary copy, not the original. Use a Handle.")
-                
-                # We intentionally discard the keeper (_) here because we assume
-                # the caller is holding the object alive.
+                    warnings.warn("SecureMemory: protect_from_fork called on immutable 'bytes'.")
+
                 addr, length, _ = self._address_and_length(data_or_handle)
 
             # MADV_DONTFORK = 10 on Linux
-            MADV_DONTFORK = 10
+            madv_dont_fork = 10
 
-            # Ensure madvise signature is set
+            # Ensure madvise signature is set (might be missing on some libcs)
             if not hasattr(self.libc, "madvise"):
-                self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                self.libc.madvise.restype = ctypes.c_int
+                return False
 
-            rc = self.libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(length), MADV_DONTFORK)
+            rc = self.libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(length), madv_dont_fork)
             return rc == 0
 
         except Exception as e:
             warnings.warn(f"SecureMemory: fork protection failed: {e}")
             return False
-        
-    def cleanup_all(self) -> None:
+
+    def cleanup_all(self) -> Dict[str, int]:
         """
         Zero and unlock all tracked memory regions
 
@@ -417,26 +370,35 @@ class SecureMemory:
             - Zeros all locked regions before unlocking
             - Best-effort cleanup (doesn't raise exceptions)
 
-        Example:
-            >>> sm = SecureMemory()
-            >>> atexit.register(sm.cleanup_all)
         """
+        result = {
+            "total": 0,
+            "zeroized": 0,
+            "unlock_failed": 0,
+            "zeroize_failed": 0
+        }
 
+        # Copy set to list to allow modification during iteration if needed
         active_handles = list(self._handles)
-        
-        for handle in active_handles:
-            try:
-                # 1. Zeroize
-                if handle.addr and handle.length > 0:
-                    ctypes.memset(handle.addr, 0, handle.length)
+        result["total"] = len(active_handles)
 
-                # 2. Unlock
-                if handle.locked:
-                    if IS_WINDOWS and self.kernel32:
-                        self.kernel32.VirtualUnlock(ctypes.c_void_p(handle.addr), ctypes.c_size_t(handle.length))
-                    elif self.libc and hasattr(self.libc, 'munlock'):
-                        self.libc.munlock(ctypes.c_void_p(handle.addr), ctypes.c_size_t(handle.length))
-            except Exception:
-                pass
-        
+        for handle in active_handles:
+            # 1. Zeroize
+            if self.zeroize(handle):
+                result["zeroized"] += 1
+            else:
+                result["zeroize_failed"] += 1
+
+            # 2. Unlock
+            # (zeroize checks handle validity, unlock_memory handles logic)
+            if not self.unlock_memory(handle):
+                result["unlock_failed"] += 1
+
         self._handles.clear()
+        return result
+
+    def _cleanup_all_silent(self):
+        try:
+            self.cleanup_all()
+        except Exception:
+            pass

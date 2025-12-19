@@ -4,6 +4,7 @@ Handles adaptive brute-force protection with dynamic delays and historical track
 """
 
 import time
+import math
 from src.database_manager import DatabaseManager
 from typing import Dict, Any, Tuple
 
@@ -16,11 +17,11 @@ class AdaptiveLockout:
     def __init__(self, dbmanager: DatabaseManager, config: Dict[str, Any]):
         """
         Initialize adaptive lockout manager
-        
+
         Args:
             dbmanager: Instance of DatabaseManager for metadata access
             config: Config dictionary or object
-            
+
         Loads historical failed login timestamps from database and initializes counters.
         """
         self.dbmanager = dbmanager
@@ -31,7 +32,7 @@ class AdaptiveLockout:
         for key in config_keys:
             if key in self.config and not isinstance(self.config[key], int):
                 raise ValueError("AdaptiveLockout config values must be integers")
-            
+
         try:
             self.max_delay = int(
                 self.config.get("max_lockout_delay", self.DEFAULT_MAX_DELAY)
@@ -51,38 +52,15 @@ class AdaptiveLockout:
 
     def record_failure(self):
         """
-        Record a failed unlock attempt.
-        
-        Actions:
-        - Increment current session failure counter.
-        - Append current UNIX timestamp (int) to failed_attempt_history list.
-        - Trim failed_attempt_history to last 100 entries.
-        - Save updated history JSON to database metadata.
-        """
-        # DB layer handles insertion + time-based pruning
-        self.dbmanager.record_lockout_failure()
+        Record a failed unlock attempt via the database manager.
 
-        # AdaptiveLockout layer handles count-based pruning ONLY
-        try:
-            conn = self.dbmanager.connect()
-            conn.execute(
-                """
-                DELETE FROM lockout_attempts
-                WHERE id IN (
-                    SELECT id FROM lockout_attempts
-                    ORDER BY attempt_ts DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (self.trim_limit,)
-            )
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
+        Fixes MAJOR-11 (Race Condition): Delegates transaction entirely to
+        DatabaseManager to ensure atomic Insert + Prune.
+        """
+        self.dbmanager.record_lockout_failure(
+            retention_seconds=self.history_window,
+            trim_limit=self.trim_limit
+        )
 
     def check_and_delay(self) -> Tuple[bool, int]:
         """
@@ -105,20 +83,31 @@ class AdaptiveLockout:
         last_attempt = timestamps[-1]
         time_since_last = max(0, now - int(last_attempt))
 
-        # Exponential backoff: 1s, 2s, 4s, ... capped by max_delay
-        # Use (count-1) but guard against huge exponent.
+        # Fix MAJOR-10: Cap exponent logic to prevent overflow/waste
+        # Calculate max useful exponent: 2^x = max_delay  =>  x = log2(max_delay)
+        if max_delay > 1:
+            max_useful_exp = int(math.ceil(math.log2(max_delay)))
+        else:
+            max_useful_exp = 0
+
+        # Exponential backoff: 1s, 2s, 4s...
         exp = count - 1
         if exp < 0:
             exp = 0
-        # avoid ridiculously large intermediate by bounding exponent
-        max_exp = 31  # 2**31 is already huge; will be capped by max_delay
-        exp = min(exp, max_exp)
-        delay = min(max_delay, 2 ** exp)
+
+        # Clamp exponent BEFORE power calculation
+        exp = min(exp, max_useful_exp)
+
+        # Calculate delay
+        delay = 2 ** exp
+
+        # Final safety clip
+        delay = min(delay, max_delay)
 
         remaining = delay - time_since_last
         if remaining <= 0:
             return True, 0
-        return False, remaining
+        return False, int(remaining)
 
     def reset_session(self):
         """

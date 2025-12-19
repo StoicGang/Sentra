@@ -11,6 +11,7 @@ import re
 import secrets
 import math
 import os
+import warnings
 
 BASE_PATTERNS = {
     "password", "123456", "qwerty", "letmein", "admin", "welcome", "sentra",
@@ -19,6 +20,9 @@ BASE_PATTERNS = {
     "love", "iloveyou", "superman", "batman", "jesus", "god"
 }
 SPECIAL_CHARS = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+
+MAX_ENTROPY_LEN = 256 
+RULE_MIN = 8
 
 class PasswordGenerator:
     """
@@ -57,43 +61,46 @@ class PasswordGenerator:
 
         self.common_passwords = set()
         self._load_dictionary(dict_path)
-        self.dictionary_loaded = False
-        self.dictionary_size = 0
-
 
     def _load_dictionary(self, path: str):
         """
         Load common passwords from a text file into memory.
         """
         try:
-            # Handle relative paths from project root
             if not os.path.isabs(path):
-                # Assuming src/password_generator.py, go up one level to root
                 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 path = os.path.join(base_dir, path)
 
             if os.path.exists(path):
-                self.dictionary_loaded = True
-                self.dictionary_size = len(self.common_passwords)
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    # Read lines, strip whitespace, and filter short ones
                     for line in f:
                         word = line.strip().lower()
                         if len(word) > 3:
                             self.common_passwords.add(word)
-                print(f"Loaded {len(self.common_passwords)} common passwords from dictionary.")
+
+                self.dictionary_loaded = True
+                self.dictionary_size = len(self.common_passwords)
+
             else:
-                # Silent fallback or warning
                 self.dictionary_loaded = False
                 self.dictionary_size = 0
-                pass
-                print(f"Warning: Password dictionary not found at {path}")
-        except Exception:
-            pass
+                warnings.warn(
+                    f"Password dictionary not found at {path}. "
+                    "Password strength evaluation is degraded.",
+                    RuntimeWarning
+                )
+
+        except Exception as e:
+            self.dictionary_loaded = False
+            self.dictionary_size = 0
+            warnings.warn(
+                f"Password dictionary failed to load ({e}). "
+                "Password strength evaluation is degraded.",
+                RuntimeWarning
+            )
+
 
     def _generate_strong_password(self, length: int) -> Tuple[str, str]:
-        RULE_MIN = 8
-
         if length < RULE_MIN:
             raise ValueError(f"Password length must be at least {RULE_MIN}.")
         if length > self.max_length:
@@ -139,39 +146,41 @@ class PasswordGenerator:
             if pwd not in used_passwords:
                 return pwd, warn
             
-    def _levenshtein_distance(self, s1: str, s2: str) -> int:
+    def _levenshtein_distance(self, s1: str, s2: str, max_dist: int = None) -> int:
         """
         Calculates edit distance (inserts, deletes, substitutions) between two strings.
         Used for fuzzy matching against dictionary words and user inputs.
         """
+        if max_dist is not None and abs(len(s1) - len(s2)) > max_dist:
+            return max_dist + 1
+
         if len(s1) < len(s2):
             return self._levenshtein_distance(s2, s1)
         if len(s2) == 0:
             return len(s1)
             
         previous_row = list(range(len(s2) + 1))
+
         for i, c1 in enumerate(s1):
             current_row = [i + 1]
+            min_in_row = current_row[0]
+
             for j, c2 in enumerate(s2):
                 insertions = previous_row[j + 1] + 1
                 deletions = current_row[j] + 1
                 substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
+                val = min(insertions, deletions, substitutions)
+                current_row.append(val)
+                min_in_row = min(min_in_row, val)
+
+            if max_dist is not None and min_in_row > max_dist:
+                return max_dist + 1  # early abort
+
             previous_row = current_row
+
         return previous_row[-1]
     
     def calculate_strength(self, password:str, user_inputs: Optional[List[str]] = None) -> Tuple[int, str, Dict]:
-        """
-        Evaluate password strength.
-
-        Args:
-            password: The password string to evaluate.
-
-        Returns:
-            score (int): 0-100 strength score
-            label (str): Strength label
-            diagnostics (Dict): Detailed components of scoring, e.g. entropy_bits, deductions
-        """
         diagnostics: Dict[str, object] = {}
         length = len(password)
         lower_pw = password.lower()
@@ -186,7 +195,12 @@ class PasswordGenerator:
         diagnostics['charset_size'] = charset_size
         diagnostics["length"] = length
 
-        entropy_bits = length * math.log2(charset_size) if charset_size else 0
+        effective_length = min(length, MAX_ENTROPY_LEN)
+
+        entropy_bits = (
+            effective_length * math.log2(charset_size)
+            if charset_size > 0 else 0
+        )
         diagnostics["entropy_bits"] = round(entropy_bits, 2)
 
         # 2. Penalty Calculation (Running Total)
@@ -247,7 +261,7 @@ class PasswordGenerator:
         # Catches "P@ssw0rd!" (variations of base words)
         for word in BASE_PATTERNS:
             threshold = 1 if len(word) < 5 else 2
-            if word in normalized or self._levenshtein_distance(normalized, word) <= threshold:
+            if word in normalized or self._levenshtein_distance(normalized, word, threshold) <= threshold:
                 deductions += 25
                 diagnostics.setdefault("dictionary_matches", []).append(word)
 
@@ -258,7 +272,7 @@ class PasswordGenerator:
                 
                 # Check fuzzy match against user info
                 threshold = 1 if len(input_norm) < 5 else 2
-                if input_norm in normalized or self._levenshtein_distance(normalized, input_norm) <= threshold:
+                if input_norm in normalized or self._levenshtein_distance(normalized, input_norm, threshold) <= threshold:
                     deductions += 30  # Heavy penalty for using own name/email
                     diagnostics.setdefault("context_matches", []).append(input_word)
 

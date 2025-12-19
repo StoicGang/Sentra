@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS entries (
     
     -- Security Health
     password_strength INTEGER CHECK (password_strength BETWEEN 0 AND 100),
-    password_age_days INTEGER DEFAULT 0,
     
     -- Soft Delete
     is_deleted INTEGER DEFAULT 0 CHECK (is_deleted IN (0, 1)),
@@ -111,8 +110,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entry_id TEXT NOT NULL,
     action_type TEXT NOT NULL CHECK (action_type IN ('CREATE', 'UPDATE', 'SOFT_DELETE', 'RESTORE', 'HARD_DELETE')),
-    timestamp TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
+    timestamp TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp 
@@ -202,9 +200,27 @@ END;
 -- 3. DELETE (Hard Delete): Remove from FTS and Log
 CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries 
 BEGIN
+    -- Only remove from FTS if it wasn't already in the trash (is_deleted=0)
+    -- This prevents "double delete" corruption in the index.
     INSERT INTO entries_fts(entries_fts, rowid, id, title, url, username, tags)
-    SELECT 'delete', old.rowid, old.id, old.title, old.url, old.username, old.tags;
+    SELECT 'delete', old.rowid, old.id, old.title, old.url, old.username, old.tags
+    WHERE old.is_deleted = 0;
 
-    -- Note: Audit log for hard delete relies on the ID before it vanishes
     INSERT INTO audit_log (entry_id, action_type) VALUES (old.id, 'HARD_DELETE');
+END;
+
+CREATE TABLE IF NOT EXISTS totp_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    secret_id TEXT NOT NULL,
+    attempt_ts INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_totp_attempts_secret_time
+ON totp_attempts(secret_id, attempt_ts);
+
+CREATE TRIGGER IF NOT EXISTS prune_totp_attempts
+AFTER INSERT ON totp_attempts
+BEGIN
+    DELETE FROM totp_attempts
+    WHERE attempt_ts < CAST(strftime('%s','now','-1 day') AS INTEGER);
 END;

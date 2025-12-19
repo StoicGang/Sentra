@@ -22,6 +22,7 @@ from src.crypto_engine import (
 from src.password_generator import PasswordGenerator
 from src.database_manager import DatabaseError, DatabaseManager
 from src.secure_memory import SecureMemory
+import threading
 
 class VaultError(Exception):
     """Base exception for vault operations"""
@@ -51,7 +52,7 @@ class VaultController:
     
     Security:
         - Master key: Stored in SecureMemory while unlocked
-        - Vault key: Stored in SecurMemory while unlocked
+        - Vault key: Stored in SecureMemory while unlocked
         - Entry keys: Derived on-demand, never persisted
         - Fail-fast: All operations check is_unlocked flag
     """
@@ -86,6 +87,8 @@ class VaultController:
 
         # Metadata
         self.unlock_timestamp: Optional[str] = None
+        self._state_lock = threading.RLock()
+        self._schema_initialized = False
     
     def _check_unlocked(self) -> None:
         """
@@ -94,8 +97,12 @@ class VaultController:
         Raises:
             VaultLockedError: If vault is locked
         """
-        if not self.is_unlocked:
-            raise VaultLockedError("Vault is locked. Call unlock_vault() first.")
+        with self._state_lock:
+            if not self.is_unlocked:
+                raise VaultLockedError("Vault is locked. Call unlock_vault() first.")
+
+            if self.master_key_secure is None or self.vault_key_secure is None:
+                raise CriticalVaultError("Inconsistent State: Unlocked without active key handles.")
 
     def vault_exists(self) -> bool:
         """
@@ -118,320 +125,323 @@ class VaultController:
             # Known DB error: treat as "not initialized" for CLI's decision path
             return False
         except Exception as e:
+            if hasattr(self, "_schema_initialized"):
+                del self._schema_initialized
             # Unexpected errors: surface a warning in logs, but treat as not-initialized
             warnings.warn(f"vault_exists() check failed: {e}", RuntimeWarning)
             return False
 
-    def unlock_vault(self, password: str) -> bool:
-        """ 
-        Unlock vault and derive hierarchical keys
-        
-        Args:
-            password: User's master password
-        
-        Returns: 
-            True if unlcok successful
-            
-        Raises:
-            VaultError: If vault already unlocked or auth fails
-            DatabaseError: If database operation fails
-        """
-
-        if self.is_unlocked:
-            raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.") 
-        
-        allowed, delay = self.adaptive_lockout.check_and_delay()
-        if not allowed:
-            raise VaultLockedError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
-
-        if not password or not isinstance(password, str):
-            raise VaultError("Password must be a non-empty string")
-        
-        # Initialize the database
-        if not hasattr(self, "_schema_initialized"):
-            self.db.initialize_database()
-            self._schema_initialized = True
-
-        # Load metadata
-        metadata = self.db.load_vault_metadata()
-
-        # KDF parameters (used for both new and existing vaults)
-        kdf_params = {
-            "algorithm": "argon2id", 
-            "time_cost": 3, 
-            "memory_cost": 64 * 1024,  # KB
-            "parallelism": 1, 
-            "salt_len": 16, 
-            "hash_len": 32
-        }
-
-        # If no metadata is present (new vault)
-        if metadata is None:
-            salt = generate_salt(kdf_params["salt_len"])  # Generate the salt
-
-            # Derive master key from password + salt
-            master_key = derive_master_key(
-                password=password, 
-                salt=salt, 
-                time_cost=kdf_params["time_cost"],  
-                memory_cost=kdf_params["memory_cost"],
-                parallelism=kdf_params["parallelism"],
-                hash_len=kdf_params["hash_len"],
-            )
-
-            # Vault key used to derive per-entry keys
-            vault_key = generate_key(32)
-            vault_key_json = json.dumps({"vault_key": vault_key.hex()})
-
-            # Auth hash binds password to fixed context for password verification
-            auth_hash = compute_auth_hash(password, salt)
-
-            # AEAD encrypt vault key under master key; store nonce + ciphertext + tag
-            ciphertext, nonce, tag = encrypt_entry(
-                plaintext=vault_key_json, 
-                key=master_key,
-                associated_data=b"vault-key-v1"
-            )
-            
-            # metadata to save
-            saved = self.db.save_vault_metadata(
-                salt=salt,
-                auth_hash=auth_hash,
-                vault_key_encrypted=ciphertext,
-                vault_key_nonce=nonce,
-                vault_key_tag=tag,
-                kdf_config=kdf_params
-            )
-
-            if not saved:
-                raise VaultError("Vault metadata already exists, cannot initialize new vault.")
-
-            # 1. Reload from DB
-            verify_meta = self.db.load_vault_metadata()
-            if not verify_meta:
-                try:
-                    self.db.delete_vault_metadata()
-                except Exception:
-                    pass
-                raise CriticalVaultError("Vault metadata saved but could not be reloaded.")
-            
-            # 2. Verify KDF Config JSON integrity
+    def unlock_vault(self, password: str, create_if_missing: bool = False) -> bool:
+        with self._state_lock:
+            if self.is_unlocked:
+                raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.")
             try:
-                if verify_meta.get("kdf_config"):
-                    json.loads(verify_meta["kdf_config"])
-            except Exception:
-                try:
-                    self.db.delete_vault_metadata()
-                except Exception:
-                    pass
-                raise VaultError("Vault initialization failed: Corrupt KDF config storage.")
+                # Use the hasattr check as seen in your file, or self._schema_initialized if you defined it
+                if not hasattr(self, "_schema_initialized"):
+                    self.db.initialize_database()
+                    self._schema_initialized = True
+            except Exception as e:
+                raise VaultError(f"Database initialization failed: {e}")
+
+            allowed, delay = self.adaptive_lockout.check_and_delay()
+            if not allowed:
+                raise VaultLockedError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
+
+            if not password or not isinstance(password, str):
+                raise VaultError("Password must be a non-empty string")
             
-            # 3. Verify Cryptographic Round-Trip
-            # Attempt to decrypt the key we just saved. If this fails, the vault is broken.
-            try:
-                roundtrip_json = decrypt_entry(
-                    ciphertext=verify_meta["vault_key_encrypted"],
-                    nonce=verify_meta["vault_key_nonce"],
-                    auth_tag=verify_meta["vault_key_tag"],
-                    key=master_key,
-                    associated_data=b"vault-key-v1",
+            # Initialize the database
+            if not hasattr(self, "_schema_initialized"):
+                self.db.initialize_database()
+                self._schema_initialized = True
+
+            # Load metadata
+            metadata = self.db.load_vault_metadata()
+
+            # KDF parameters (used for both new and existing vaults)
+            kdf_params = {
+                "algorithm": "argon2id", 
+                "time_cost": 3, 
+                "memory_cost": 64 * 1024,  # KB
+                "parallelism": 1, 
+                "salt_len": 16, 
+                "hash_len": 32
+            }
+
+            # If no metadata is present (new vault)
+            if metadata is None:
+                if not create_if_missing:
+                    raise VaultError(
+                        "No vault exists at this path. "
+                        "Use explicit vault creation before unlocking."
+                    )
+
+                salt = generate_salt(kdf_params["salt_len"])  # Generate the salt
+
+                # Derive master key from password + salt
+                master_key = derive_master_key(
+                    password=password, 
+                    salt=salt, 
+                    time_cost=kdf_params["time_cost"],  
+                    memory_cost=kdf_params["memory_cost"],
+                    parallelism=kdf_params["parallelism"],
+                    hash_len=kdf_params["hash_len"],
                 )
-                vault_key_roundtrip = json.loads(roundtrip_json)["vault_key"]
-                if vault_key_roundtrip != vault_key.hex():
-                    raise ValueError("Vault key mismatch after round-trip decrypt.")
-            except Exception as e:
-                try:
-                    self.db.delete_vault_metadata()
-                except Exception:
-                    pass
-                raise CriticalVaultError(f"Critical vault integrity failure: {e}")
-            
-        else:
-            # Existing vault - use stored parameters or fall back to defaults
-            if metadata.get("kdf_config"):
-                try:
-                    loaded = json.loads(metadata["kdf_config"])
-                    # Normalize/validate kdf params to expected integer types with safe defaults
-                    kdf_params = {
-                        "algorithm": loaded.get("algorithm", "argon2id"),
-                        "time_cost": int(loaded.get("time_cost", 3)),
-                        "memory_cost": int(loaded.get("memory_cost", 64 * 1024)),
-                        "parallelism": int(loaded.get("parallelism", 1)),
-                        "salt_len": int(loaded.get("salt_len", 16)),
-                        "hash_len": int(loaded.get("hash_len", 32)),
-                    }
-                except Exception:
-                    warnings.warn("Corrupt or invalid KDF config in DB; using defaults.", RuntimeWarning)
-                    # keep current kdf_params (defaults from above)
-            
-            # Ensure salt is present
-            try:
-                salt = metadata["salt"]
-            except KeyError:
-                raise VaultError("Vault metadata missing salt; cannot verify password.")
 
-            # verify password (auth hash binds password to stored salt)
-            try:
-                ok = verify_auth_hash(metadata["auth_hash"], password, salt)
-            except Exception as e:
-                # Unexpected error while verifying (DB corrupt or HMAC failure)
-                raise DatabaseError(f"Auth verification failed: {e}") from e
+                # Vault key used to derive per-entry keys
+                vault_key = generate_key(32)
+                vault_key_json = json.dumps({"vault_key": vault_key.hex()})
 
-            if not ok:
-                # record failure and surface a clear error
-                self.adaptive_lockout.record_failure()
-                raise VaultError("Invalid password")
+                # Auth hash binds password to fixed context for password verification
+                auth_hash = compute_auth_hash(password, salt)
 
-            # Derive Master Key only after auth succeeds
-            master_key = derive_master_key(
-                password=password,
-                salt=salt,
-                time_cost=kdf_params["time_cost"],
-                memory_cost=kdf_params["memory_cost"],
-                parallelism=kdf_params["parallelism"],
-                hash_len=kdf_params["hash_len"]
-            )
-
-            # Decrypt vault key (round-trip)
-            try:
-                vault_key_json = decrypt_entry(
-                    ciphertext=metadata["vault_key_encrypted"],
-                    nonce=metadata["vault_key_nonce"],
-                    auth_tag=metadata["vault_key_tag"],
+                # AEAD encrypt vault key under master key; store nonce + ciphertext + tag
+                ciphertext, nonce, tag = encrypt_entry(
+                    plaintext=vault_key_json, 
                     key=master_key,
                     associated_data=b"vault-key-v1"
                 )
-                vault_key_dict = json.loads(vault_key_json)
-                vault_key = bytes.fromhex(vault_key_dict["vault_key"])
-            except Exception as e:
-                # Do not reset lockout history here — treat as a cryptographic failure
-                raise VaultError("Failed to decrypt vault key or parse stored data.") from e
+                
+                # metadata to save
+                saved = self.db.save_vault_metadata(
+                    salt=salt,
+                    auth_hash=auth_hash,
+                    vault_key_encrypted=ciphertext,
+                    vault_key_nonce=nonce,
+                    vault_key_tag=tag,
+                    kdf_config=kdf_params
+                )
 
-        # Store keys in secure memory
-        # Secure-memory lock + proper zeroization and lockout reset placement
-        try:
-            # Convert to mutable buffers that we can zeroize
-            master_buf = bytearray(master_key)
-            vault_buf = bytearray(vault_key)
+                if not saved:
+                    raise VaultError("Vault metadata already exists, cannot initialize new vault.")
 
-            # Remove immutable originals asap (they were bytes)
-            try:
-                del master_key
-            except NameError:
-                pass
-            try:
-                del vault_key
-            except NameError:
-                pass
-
-            # Attempt to lock master key into secure memory
-            self.master_key_handle = self.secure_mem.lock_memory(master_buf)
-            if not self.master_key_handle:
-                # Wipe python-side buffers immediately and error out
-                master_buf[:] = b'\x00' * len(master_buf)
-                vault_buf[:] = b'\x00' * len(vault_buf)
-                raise CriticalVaultError("CRITICAL: Failed to acquire lock handle for master key.")
-
-            # Prevent fork inheritance for the master key
-            self.secure_mem.protect_from_fork(self.master_key_handle)
-
-            # Now lock vault key into secure memory
-            self.vault_key_handle = self.secure_mem.lock_memory(vault_buf)
-            if not self.vault_key_handle:
-                # Wipe python buffers and securely release master key handle
-                vault_buf[:] = b'\x00' * len(vault_buf)
-
-                # best-effort cleanup of master handle
+                # 1. Reload from DB
+                verify_meta = self.db.load_vault_metadata()
+                if not verify_meta:
+                    try:
+                        self.db.delete_vault_metadata()
+                    except Exception:
+                        pass
+                    raise CriticalVaultError("Vault metadata saved but could not be reloaded.")
+                
+                # 2. Verify KDF Config JSON integrity
                 try:
-                    self.secure_mem.zeroize(self.master_key_handle)
-                    self.secure_mem.unlock_memory(self.master_key_handle)
+                    if verify_meta.get("kdf_config"):
+                        json.loads(verify_meta["kdf_config"])
                 except Exception:
-                    pass
-                self.master_key_handle = None
-
-                # wipe remaining python master buffer and raise
-                master_buf[:] = b'\x00' * len(master_buf)
-                raise CriticalVaultError("CRITICAL: Failed to acquire lock handle for vault key.")
-
-            # Prevent fork inheritance for the vault key
-            self.secure_mem.protect_from_fork(self.vault_key_handle)
-
-            # At this point both keys are locked into secure memory.
-            # Keep a single, controlled python-side bytearray while unlocked.
-            # This buffer is the authoritative in-process copy and will be
-            # securely zeroized in lock_vault().
-            self.master_key_secure = master_buf
-            self.vault_key_secure = vault_buf
-
-            # Best-effort: remove local transient names (we still keep the buffers via attributes)
-            try:
-                del master_buf
-                del vault_buf
-            except Exception:
-                pass
-
-        except Exception as e:
-            # Clean up any handles we successfully obtained
-            if self.master_key_handle:
+                    try:
+                        self.db.delete_vault_metadata()
+                    except Exception:
+                        pass
+                    raise VaultError("Vault initialization failed: Corrupt KDF config storage.")
+                
+                # 3. Verify Cryptographic Round-Trip
+                # Attempt to decrypt the key we just saved. If this fails, the vault is broken.
                 try:
-                    self.secure_mem.zeroize(self.master_key_handle)
-                    self.secure_mem.unlock_memory(self.master_key_handle)
-                except Exception:
-                    pass
-                self.master_key_handle = None
-
-            if self.vault_key_handle:
+                    roundtrip_json = decrypt_entry(
+                        ciphertext=verify_meta["vault_key_encrypted"],
+                        nonce=verify_meta["vault_key_nonce"],
+                        auth_tag=verify_meta["vault_key_tag"],
+                        key=master_key,
+                        associated_data=b"vault-key-v1",
+                    )
+                    vault_key_roundtrip = json.loads(roundtrip_json)["vault_key"]
+                    if vault_key_roundtrip != vault_key.hex():
+                        raise ValueError("Vault key mismatch after round-trip decrypt.")
+                except Exception as e:
+                    try:
+                        self.db.delete_vault_metadata()
+                    except Exception:
+                        pass
+                    raise CriticalVaultError(f"Critical vault integrity failure: {e}")
+                
+            else:
+                # Existing vault - use stored parameters or fall back to defaults
+                if metadata.get("kdf_config"):
+                    try:
+                        loaded = json.loads(metadata["kdf_config"])
+                        # Normalize/validate kdf params to expected integer types with safe defaults
+                        kdf_params = {
+                            "algorithm": loaded.get("algorithm", "argon2id"),
+                            "time_cost": int(loaded.get("time_cost", 3)),
+                            "memory_cost": int(loaded.get("memory_cost", 64 * 1024)),
+                            "parallelism": int(loaded.get("parallelism", 1)),
+                            "salt_len": int(loaded.get("salt_len", 16)),
+                            "hash_len": int(loaded.get("hash_len", 32)),
+                        }
+                    except Exception:
+                        warnings.warn("Corrupt or invalid KDF config in DB; using defaults.", RuntimeWarning)
+                        # keep current kdf_params (defaults from above)
+                
+                # Ensure salt is present
                 try:
-                    self.secure_mem.zeroize(self.vault_key_handle)
-                    self.secure_mem.unlock_memory(self.vault_key_handle)
-                except Exception:
+                    salt = metadata["salt"]
+                except KeyError:
+                    raise VaultError("Vault metadata missing salt; cannot verify password.")
+
+                # verify password (auth hash binds password to stored salt)
+                try:
+                    ok = verify_auth_hash(metadata["auth_hash"], password, salt)
+                except Exception as e:
+                    # Unexpected error while verifying (DB corrupt or HMAC failure)
+                    raise DatabaseError(f"Auth verification failed: {e}") from e
+
+                if not ok:
+                    # record failure and surface a clear error
+                    self.adaptive_lockout.record_failure()
+                    raise VaultError("Invalid password")
+
+                # Derive Master Key only after auth succeeds
+                master_key = derive_master_key(
+                    password=password,
+                    salt=salt,
+                    time_cost=kdf_params["time_cost"],
+                    memory_cost=kdf_params["memory_cost"],
+                    parallelism=kdf_params["parallelism"],
+                    hash_len=kdf_params["hash_len"]
+                )
+
+                # Decrypt vault key (round-trip)
+                try:
+                    vault_key_json = decrypt_entry(
+                        ciphertext=metadata["vault_key_encrypted"],
+                        nonce=metadata["vault_key_nonce"],
+                        auth_tag=metadata["vault_key_tag"],
+                        key=master_key,
+                        associated_data=b"vault-key-v1"
+                    )
+                    vault_key_dict = json.loads(vault_key_json)
+                    vault_key = bytes.fromhex(vault_key_dict["vault_key"])
+                except Exception as e:
+                    self.adaptive_lockout.record_failure()
+                    # Do not reset lockout history here — treat as a cryptographic failure
+                    raise VaultError("Invalid password or vault corrupted.") from e
+
+            # Store keys in secure memory
+            # Secure-memory lock + proper zeroization and lockout reset placement
+            try:
+                # Convert to mutable buffers that we can zeroize
+                master_buf = bytearray(master_key)
+                vault_buf = bytearray(vault_key)
+
+                # Remove immutable originals asap (they were bytes)
+                try:
+                    del master_key
+                except NameError:
                     pass
-                self.vault_key_handle = None
+                try:
+                    del vault_key
+                except NameError:
+                    pass
 
-            # Propagate CRITICAL errors as-is, others as VaultError
-            if isinstance(e, CriticalVaultError):
-                raise
+                # Attempt to lock master key into secure memory
+                self.master_key_handle = self.secure_mem.lock_memory(master_buf)
+                if not self.master_key_handle:
+                    # Wipe python-side buffers immediately and error out
+                    master_buf[:] = b'\x00' * len(master_buf)
+                    vault_buf[:] = b'\x00' * len(vault_buf)
+                    raise CriticalVaultError("CRITICAL: Failed to acquire lock handle for master key.")
 
-            raise VaultError(f"Secure memory lock failed: {e}") from e
+                # Prevent fork inheritance for the master key
+                self.secure_mem.protect_from_fork(self.master_key_handle)
 
-        try:
-            # First, reset lockout session now that unlock succeeded fully
-            try:
-                self.adaptive_lockout.reset_session()
-            except Exception:
-                # Non-fatal: log and continue unlock — do not fail unlock for this.
-                warnings.warn("Warning: failed to reset adaptive lockout after successful unlock.", RuntimeWarning)
+                # Now lock vault key into secure memory
+                self.vault_key_handle = self.secure_mem.lock_memory(vault_buf)
+                if not self.vault_key_handle:
+                    # Wipe python buffers and securely release master key handle
+                    vault_buf[:] = b'\x00' * len(vault_buf)
 
-            # Mark unlocked state and timestamp
-            self.unlock_timestamp = datetime.now(timezone.utc).isoformat()
-            self.is_unlocked = True
-
-            # Persist last_unlocked_at in DB; non-fatal if it fails (we already unlocked)
-            try:
-                self.db.update_unlock_timestamp()
-            except Exception as e:
-                warnings.warn(f"Failed to update unlock timestamp: {e}", RuntimeWarning)
-
-            return True
-
-        except Exception as e:
-            # Defensive cleanup if anything in the finalization fails
-            # (zeroize/unlock will be handled by lock_vault or here)
-            try:
-                if self.master_key_handle:
-                    self.secure_mem.zeroize(self.master_key_handle)
-                    self.secure_mem.unlock_memory(self.master_key_handle)
+                    # best-effort cleanup of master handle
+                    try:
+                        self.secure_mem.zeroize(self.master_key_handle)
+                        self.secure_mem.unlock_memory(self.master_key_handle)
+                    except Exception:
+                        pass
                     self.master_key_handle = None
-            except Exception:
-                pass
-            try:
+
+                    # wipe remaining python master buffer and raise
+                    master_buf[:] = b'\x00' * len(master_buf)
+                    raise CriticalVaultError("CRITICAL: Failed to acquire lock handle for vault key.")
+
+                # Prevent fork inheritance for the vault key
+                self.secure_mem.protect_from_fork(self.vault_key_handle)
+
+                # At this point both keys are locked into secure memory.
+                # Keep a single, controlled python-side bytearray while unlocked.
+                # This buffer is the authoritative in-process copy and will be
+                # securely zeroed in lock_vault().
+                self.master_key_secure = master_buf
+                self.vault_key_secure = vault_buf
+
+                self.is_unlocked = True
+
+                # Best-effort: remove local transient names (we still keep the buffers via attributes)
+                try:
+                    del master_buf
+                    del vault_buf
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # Clean up any handles we successfully obtained
+                if self.master_key_handle:
+                    try:
+                        self.secure_mem.zeroize(self.master_key_handle)
+                        self.secure_mem.unlock_memory(self.master_key_handle)
+                    except Exception:
+                        pass
+                    self.master_key_handle = None
+
                 if self.vault_key_handle:
-                    self.secure_mem.zeroize(self.vault_key_handle)
-                    self.secure_mem.unlock_memory(self.vault_key_handle)
+                    try:
+                        self.secure_mem.zeroize(self.vault_key_handle)
+                        self.secure_mem.unlock_memory(self.vault_key_handle)
+                    except Exception:
+                        pass
                     self.vault_key_handle = None
-            except Exception:
-                pass
-            raise VaultError(f"Failed to finalize vault unlock: {e}") from e
+
+                # Propagate CRITICAL errors as-is, others as VaultError
+                if isinstance(e, CriticalVaultError):
+                    raise
+
+                raise VaultError(f"Secure memory lock failed: {e}") from e
+
+            try:
+                # First, reset lockout session now that unlock succeeded fully
+                try:
+                    self.adaptive_lockout.reset_session()
+                except Exception:
+                      warnings.warn("Warning: failed to reset adaptive lockout after successful unlock.", RuntimeWarning)
+
+                # Mark unlocked state and timestamp
+                self.unlock_timestamp = datetime.now(timezone.utc).isoformat()
+
+                # Persist last_unlocked_at in DB; non-fatal if it fails (we already unlocked)
+                try:
+                    self.db.update_unlock_timestamp()
+                except Exception as e:
+                    warnings.warn(f"Failed to update unlock timestamp: {e}", RuntimeWarning)
+
+                return True
+
+            except Exception as e:
+                # Defensive cleanup if anything in the finalization fails
+                # (zeroize/unlock will be handled by lock_vault or here)
+                try:
+                    if self.master_key_handle:
+                        self.secure_mem.zeroize(self.master_key_handle)
+                        self.secure_mem.unlock_memory(self.master_key_handle)
+                        self.master_key_handle = None
+                except Exception:
+                    pass
+                try:
+                    if self.vault_key_handle:
+                        self.secure_mem.zeroize(self.vault_key_handle)
+                        self.secure_mem.unlock_memory(self.vault_key_handle)
+                        self.vault_key_handle = None
+                except Exception:
+                    pass
+                raise VaultError(f"Failed to finalize vault unlock: {e}") from e
 
     def lock_vault(self) -> bool:
         """
@@ -440,47 +450,35 @@ class VaultController:
         Returns:
             True if lock successful
         """
-        if not self.is_unlocked:
-            # Already locked, nothing to do
-            return True
-        
-        try:
-            # Zeroize and Unlock Master Key
-            if self.master_key_handle:
-                self.secure_mem.zeroize(self.master_key_handle)
-                self.secure_mem.unlock_memory(self.master_key_handle)
-                self.master_key_handle = None
-            
-            # Defensive: Explicitly wipe Python buffer to clear potential copies/references
-            if self.master_key_secure:
-                self.master_key_secure[:] = b'\x00' * len(self.master_key_secure)
-                self.master_key_secure = None
+        with self._state_lock:
+            if not self.is_unlocked:
+                return True
 
-            # Zeroize and Unlock Vault Key
-            if self.vault_key_handle:
-                self.secure_mem.zeroize(self.vault_key_handle)
-                self.secure_mem.unlock_memory(self.vault_key_handle)
-                self.vault_key_handle = None
-            
-            # Defensive: Explicitly wipe Python buffer
-            if self.vault_key_secure:
-                self.vault_key_secure[:] = b'\x00' * len(self.vault_key_secure)
-                self.vault_key_secure = None
-        
+            errors = []
+            # FIX: Attempt cleanup for ALL handles regardless of intermediate failures
+            for handle_attr, secure_attr in [
+                ('master_key_handle', 'master_key_secure'),
+                ('vault_key_handle', 'vault_key_secure')
+            ]:
+                handle = getattr(self, handle_attr)
+                secure_buf = getattr(self, secure_attr)
+
+                try:
+                    if handle:
+                        self.secure_mem.zeroize(handle)
+                        self.secure_mem.unlock_memory(handle)
+                    if secure_buf:
+                        secure_buf[:] = b'\x00' * len(secure_buf)
+                except Exception as e:
+                    errors.append(f"{handle_attr} failure: {e}")
+                finally:
+                    setattr(self, handle_attr, None)
+                    setattr(self, secure_attr, None)
+
             self.is_unlocked = False
-
-            # Close database connection cleanly 
-            try:
-                close_fn = getattr(self.db, "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception as e:
-                # non-fatal on lock, but warn for troubleshooting
-                warnings.warn(f"Warning: database close() failed during lock: {e}", RuntimeWarning)
-
+            if errors:
+                raise CriticalVaultError(f"Partial lock state! Security warning: {', '.join(errors)}")
             return True
-        except Exception as e:
-            raise VaultError(f"Failed to lock vault securely: {e}")
     
     def add_password(
         self,
@@ -493,25 +491,6 @@ class VaultController:
         tags: Optional[str] = None,
         category: str = "General"
     ) -> str:
-        """
-        Add new password entry to vault
-        
-        Args:
-            title: Entry title
-            url: Website URL
-            username: Username/email
-            password: Password
-            notes: Notes
-            tags: Comma-separated tags
-            category: Entry category
-        
-        Returns:
-            Entry ID (UUID)
-        
-        Raises:
-            VaultLockedError: If vault locked
-            VaultError: If add fails
-        """
         self._check_unlocked()  # Raise if locked
 
         try:
@@ -540,25 +519,12 @@ class VaultController:
         except Exception as e:
             raise VaultError(f"Failed to add password entry: {e}")
     
-    def get_password(self, entry_id: str) -> Optional[Dict]:
-        """
-        Retrieve password entry from vault
-        
-        Args:
-            entry_id: Entry UUID
-        
-        Returns:
-            Decrypted entry dictionary or None
-        
-        Raises:
-            VaultLockedError: If vault locked
-            VaultError: If retrieval fails
-        """
+    def get_password(self, entry_id: str, include_deleted: bool = False) -> Optional[Dict]:
         self._check_unlocked() 
 
         try:
             vault_key = bytes(self.vault_key_secure)
-            entry = self.db.get_entry(entry_id, vault_key)
+            entry = self.db.get_entry(entry_id, vault_key, include_deleted=include_deleted)
             
             if entry is None:
                 return None 
@@ -604,8 +570,11 @@ class VaultController:
     def list_entries(
         self, 
         include_deleted: bool = False,
-        limit: int = 100, 
-        offset: int = 0
+        limit: int = 100,
+        category: str = None,
+        favorite: bool = None,
+        last_timestamp : str = None,
+        last_id: str = None
     ) -> List[Dict]:
         """
         List all entries (metadata only) with pagination support.
@@ -615,13 +584,16 @@ class VaultController:
         try:
             return self.db.list_entries(
                 include_deleted=include_deleted,
+                category=category,
+                favorite=favorite,
                 limit=limit,
-                offset=offset
+                last_timestamp=last_timestamp,
+                last_id=last_id
             )
         except Exception as e:
             raise VaultError(f"Failed to list entries: {e}")
 
-    def update_entry(self, entry_id: str, **kwargs) -> bool:
+    def update_entry(self, entry_id: str, **kwargs) -> Tuple[bool, int]:
         """
         Update an existing entry.
         
@@ -727,3 +699,70 @@ class VaultController:
             vault_keys=vault_keys,
             hierarchy_keys={'vault_key': internal_vault_key}
         )
+    
+    def get_old_entries(self, days_threshold: int = 90):
+        self._check_unlocked()
+        return self.db.get_old_entries(days_threshold)
+
+    def hard_delete_entry(self, entry_id: str) -> bool:
+        """
+        Permanently delete an entry.
+        """
+        self._check_unlocked()
+        try:
+            return self.db.hard_delete_entry(entry_id)
+        except Exception as e:
+            raise VaultError(f"Failed to hard delete entry: {e}")
+
+    def import_csv(self, file_path: str) -> Tuple[int, int]:
+        """
+        Import entries from a CSV file.
+        Returns: (success_count, failure_count)
+        """
+        self._check_unlocked()
+        import csv
+
+        success_count = 0
+        fail_count = 0
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                # Use DictReader to automatically handle headers
+                reader = csv.DictReader(f)
+
+                # Normalize headers (strip whitespace)
+                if reader.fieldnames:
+                    reader.fieldnames = [name.strip() for name in reader.fieldnames]
+
+                for row in reader:
+                    try:
+                        # Robust column fetching (Case-insensitive fallback)
+                        def get_val(keys):
+                            for k in keys:
+                                if k in row and row[k]:
+                                    return row[k]
+                            return None
+
+                        title = get_val(['Title', 'title', 'name', 'Name'])
+                        if not title:
+                            # Skip rows without a title
+                            fail_count += 1
+                            continue
+
+                        self.add_password(
+                            title=title,
+                            url=get_val(['URL', 'url', 'Website', 'website']),
+                            username=get_val(['Username', 'username', 'User', 'user']),
+                            password=get_val(['Password', 'password', 'Pass', 'pass']),
+                            notes=get_val(['Notes', 'notes', 'Note', 'note']),
+                            tags=get_val(['Tags', 'tags']),
+                            category=get_val(['Category', 'category', 'Group']) or "General"
+                        )
+                        success_count += 1
+                    except Exception:
+                        fail_count += 1
+
+            return success_count, fail_count
+
+        except Exception as e:
+            raise VaultError(f"Failed to read CSV file: {e}")

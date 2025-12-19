@@ -11,7 +11,6 @@ import time
 import hashlib
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
-import json
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import hmac
@@ -19,10 +18,11 @@ import hmac
 MIN_MEMORY_KB = 8 * 1024        # 8 MB
 MAX_MEMORY_KB = 1_048_576       # 1 GB hard cap
 PBKDF2_ITERATIONS = 600_000  # OWASP 2024 baseline
+BENCHMARK_STEP_KB = 1024
 
 """
 ==========================================================================
-PART A : Random Generations (CSPRNG)
+PART A : Random Generations 
 ==========================================================================
 """
 
@@ -68,11 +68,6 @@ def generate_nonce(length: int = 12) -> bytes:
         - MUST be unique for every encryption with the same key 
         - Nonce reuse = catastrophic security failure (plaintext recovery)
         - Using CSPRNG ensures uniqueness (2^96 space)
-
-    Example:
-        >>> nonce = generate_nonce()
-        >>> len(nonce)
-        12 
     """
     result = os.urandom(length)
     return result
@@ -90,17 +85,12 @@ def generate_key(length: int = 32) -> bytes:
         
     Security: 
         - Used for generating recovery keys, vaults keys (testing), etc.
-        - 256 bits  = Industry standard for symmetic encryption
+        - 256 bits  = Industry standard for symmetric encryption
         - Never use this for master key (master key comes from password via Argon2id)
-        
-    Example: 
-        >>> key = generate_key()
-        >>> len(key)
-        32
+
     """
     result = secrets.token_bytes(length)
     return result
-    #WHY secrets instead of os.urandom? secrets is explicitly designed for crypto more randomness allowed by the OS
 
 # function to derive the master key
 def derive_master_key(
@@ -134,16 +124,16 @@ def derive_master_key(
 
     Performance:
         - Target: <= 2 sec unlock time on modern hardware
-        - Adjust parameters based on device capability 
-
-    Example: 
-        >>> password = "#ThisIsPassword123!"
-        >>> salt = generate_salt()
-        >>> master_key = derive_master_key(password, salt)
-        >>> len(master_key)
-        32
+        - Adjust parameters based on device capability
     """
-        
+    total_mem_usage_kb = memory_cost * parallelism
+
+    if total_mem_usage_kb > MAX_MEMORY_KB:
+        raise ValueError(
+            f"Argon2: Total memory usage ({total_mem_usage_kb} KB) exceeds "
+            f"system limit ({MAX_MEMORY_KB} KB). Reduce memory_cost or parallelism."
+        )
+
     if not isinstance(memory_cost, int):
         raise ValueError("Argon2 memory_cost must be an integer")
 
@@ -195,16 +185,6 @@ def compute_auth_hash(
         - This hash is STORED in vault_metadata
         - Used only for quick password verification
         - Master key is NEVER stored (derived fresh on unlock)
-
-    Example: 
-        >>> password = "MySecurePass123!" 
-        >>> salt = generate_salt()
-        >>> auth_hash = compute_auth_hash(password, salt)
-        >>> len(auth_hash)
-        32
-        >>> # Later verification:
-        >>> auth_hash == compute_auth_hash("MySecurePass123!", salt)
-        true
     """
     context = b"sentra-auth-hash-v1"
 
@@ -251,19 +231,11 @@ def benchmark_argon2_params(
     
     Algorithm:
         1. Start with min_memory, time_cost = 2
-        2. Test dervation time
-        3. It too fast -> increase memory_cost
+        2. Test derivation time
+        3. Its too fast -> increase memory_cost
         4. If too slow -> decrease memory_cost or increase time_cost
         5. find sweet spot where time ~ target_time
-
-    Example:
-        >>> params = benchmark_argon2_params(target_time=2.0)
-        >>> print(params)
-        {'time_cost': 3, 'memory_cost':65536, 'parallelism':4, 'measured_time': 1.87}
     """
-    print(" Benchmarking Argon2id parameters for your device...")
-    print(f"   Target unlock time: {target_time}s\n")
-
     test_password = "benchmark_test_password_123"
     test_salt = generate_salt()
 
@@ -303,20 +275,18 @@ def benchmark_argon2_params(
                 "measured_time": elapsed
             }
             # Try stronger parameters
-            low = mid + 1024
+            low = mid + BENCHMARK_STEP_KB
         else:
             # Too slow, reduce memory
-            high = mid - 1024
+            high = mid - BENCHMARK_STEP_KB
 
     if best is None:
-        raise RuntimeError("Failed to benchmark Argon2 parameters on this device")
-
-    print(f"\n✓ Optimal parameters found:")
-    print(f"   Time cost: {best['time_cost']}")
-    print(f"   Memory cost: {best['memory_cost']} KB ({best['memory_cost'] // 1024} MB)")
-    print(f"   Parallelism: {best['parallelism']}")
-    print(f"   Measured time: {best['measured_time']:.2f}s\n")
-
+        return {
+            "time_cost": 3,
+            "memory_cost": min_memory_kb,
+            "parallelism": parallelism,
+            "measured_time": None
+        }
     return best
 
 """
@@ -331,39 +301,13 @@ def encrypt_entry(
         key: bytes,
         associated_data: bytes = None
 ) -> Tuple[bytes, bytes, bytes]:
-    """
-    Encrypt entry data using ChaCha20-Poly1305 AEAD cipher.
-    
-    Args:
-        palintext: JSON-serialized entry data (UTF-8 string)
-        key: 32-byte encryption key (from dervie_master_key or derive_entry_key)
-        associated_data: Optinal AAD to bind ciphertext to context (e.g., entry_id + timestamp for integrity binding)
-
-    Returns: 
-        Tuple of (ciphertext, nonce, auth_tag)
-        - Ciphertext: Encrypted data (same length as plaintext)
-        - nonce: 12-byte unique nonce used for encryption
-        - auth_tag: 16-byte Poly1305 authentication tag
-
-    Security: 
-        - Nonce MUST be unique for every encryption with same key
-        - Poly1305 provides authenticated encryption (AEAD)
-        - Never reuse (key, nonce) pair
-        - AAD binds ciphertext to specific context 
-
-    Example:
-        >>> entry_json = '{\"url\": \"https://example.com\", \"password\": \"secret\"}'
-        >>> key = derive_master_key(password, salt)
-        >>> ciphertext, nonce, auth_tag = encrypt_entry(entry_json, key)
-        >>> len(ciphertext)
-        60
-        >>> len(nonce)
-        12
-        >>> len(auth_tag)
-        16  
-    """
     try:
-        if associated_data is None: associated_data = b""
+        if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+            raise ValueError("ChaCha20-Poly1305 key must be 32 bytes")
+        if not isinstance(plaintext, str):
+            raise TypeError("Encryption Failed: Plaintext must be a UTF-8 string")
+        if associated_data is None:
+            raise ValueError("associated_data must be explicitly provided")
         nonce = generate_nonce(12)
         cipher = ChaCha20Poly1305(key)
         plaintext_bytes = plaintext.encode('utf-8')
@@ -373,6 +317,7 @@ def encrypt_entry(
         ciphertext = cipher_with_tag[:-16]
         auth_tag = cipher_with_tag[-16:]
         return ciphertext, nonce, auth_tag
+
     except Exception as e:
         raise RuntimeError(f"Encryption failed: {e}")
 
@@ -384,33 +329,7 @@ def decrypt_entry(
         key: bytes, 
         associated_data: bytes = None
 ) -> str:
-    """
-    Decrypt and verify entry data using ChaCha20-Poly1305 AEAD cipher.
-    
-    Args:
-        ciphertext: Encrypted entry data
-        nonce: 12-byte nonce used during encryption
-        auth_tag: 16-byte Poly1305 authentication tag
-        key: 32-byte encryption key (same key used for encryption)
-        associated_data: Optional AAD (MUST match encryption AAD)
-        
-    Returns: 
-        Decrypted plaintext (JSON string)
-    
-    Raises: 
-        InvalidTag: If authentication tag verification fails (integrity voilation)
-        
-    Security:
-        - MUST verify auth_tag before returning plaintext
-        - Tampering detection via Poly1305 tag validation 
-        - Returns plaintext ONLY if tag is valid
-        
-    Example: 
-        >>> plaintext = decrypt_entry(ciphertext, nonce, auth_tag, key)
-        >>> json.loads(plaintext)
-        {'url': 'https://example.com', 'password': 'secret'}
-    """
-    
+
     try:
         if associated_data is None: associated_data = b""
         cipher = ChaCha20Poly1305(key)
@@ -443,20 +362,7 @@ def compute_hmac(data: bytes, key: bytes, algorithm: str = 'sha256') -> bytes:
     Security:
         - HMAC provides integrity + authenticity
         - Used for backup file verification 
-        - Attacker connot forge valid HMAC without knowing key
-    Example: 
-        >>> backup_data = b'{\"entries\": [...]}'
-        >>> key = derive_master_key(password, salt)
-        >>> hmac_tag = compute_hmac(backup_data, key)
-        >>> len(hmac_tag)
-        32
-        >>> # Verification:
-        >>> compute_hmac(backup_data, key) == hmac_tag
-        True
-        >>> # Tampering detection:
-        >>> tampered_data = backup_data[:-1] + b'x'
-        >>> compute_hmac(tampered_data, key) == hmac_tag
-        False
+        - Attacker can't forge valid HMAC without knowing key
     """
     if isinstance(key, bytearray):
         key = bytes(key)
@@ -464,7 +370,7 @@ def compute_hmac(data: bytes, key: bytes, algorithm: str = 'sha256') -> bytes:
     if isinstance(data, bytearray):
         data = bytes(data)
 
-    h = hmac.new(key, data, hashlib.sha256)
+    h = hmac.new(key, data, algorithm)
 
     return h.digest()
 
@@ -478,23 +384,10 @@ def verify_auth_hash(stored_hash: bytes, password: str, salt: bytes) -> bool:
 def derive_hkdf_key(
     master_key: bytes,
     info: bytes,
-    salt: bytes | None = None,
+    salt: bytes,
     length: int = 32
 ) -> bytes:
-    """
-    Derive a sub-key from a master key using HKDF-SHA256.
-    
-    Args:
-        master_key: The source key material (e.g., vault_key).
-        info: Context-specific byte string (e.g., b"backup-enc").
-              Different 'info' produces completely different keys.
-        salt: Optional salt. If None, defaults to a string of zero bytes.
-        length: Desired output length in bytes (default 32).
-        
-    Returns:
-        Derived key bytes.
-    """
-    if not isinstance(master_key, bytes):
+    if not isinstance(master_key, (bytes, bytearray)):
         raise TypeError("Master key must be bytes")
     
     if not salt or not isinstance(salt, (bytes, bytearray)):

@@ -6,10 +6,9 @@ Implements Time-based One-Time Password algorithm (RFC 6238) for 2FA codes.
 
 import time
 import pyotp
-from typing import Optional, Dict, Deque
+from typing import Optional
+from src.database_manager import DatabaseManager
 from urllib.parse import urlparse, parse_qs
-from src.crypto_engine import compute_hmac
-from collections import deque
 
 class RateLimitError(Exception):
     """Raised when TOTP verification attempts exceed the limit."""
@@ -20,11 +19,9 @@ class TOTPGenerator:
     TOTP generator compliant with RFC 6238
     """
 
-    def __init__(self):
+    def __init__(self, db_path: str = "data/vault.db"):
         # Rate Limiting State
-        # Dictionary mapping secure_id -> Deque of timestamps
-        self._limits: Dict[str, Deque[float]] = {}
-        
+        self.db = DatabaseManager(db_path)
         # Policy: Max 5 attempts every 30 seconds
         self.RATE_LIMIT_COUNT = 5
         self.RATE_LIMIT_WINDOW = 30.0
@@ -32,7 +29,7 @@ class TOTPGenerator:
         # Internal key for tracking (does not need to be persisted)
         self._tracking_salt = b"sentra-totp-tracking"
 
-    def _check_rate_limit(self, secret: str) -> bool:
+    def _check_rate_limit(self, entry_id: str) -> bool:
         """
         Check if attempts for this secret exceed the policy.
         
@@ -40,34 +37,18 @@ class TOTPGenerator:
         - Uses crypto_engine.compute_hmac to create a deterministic ID.
         - Prevents storing raw secrets in the rate-limit memory.
         """
-        now = time.time()
-        
-        # FIX: Delegate hashing to crypto_engine
-        # We use the secret as 'data' and a static salt as 'key' 
-        # to generate a unique tracking ID.
-        secret_id = compute_hmac(
-            data=secret.encode('utf-8'), 
-            key=self._tracking_salt
-        ).hex()
-        
-        if secret_id not in self._limits:
-            self._limits[secret_id] = deque()
-            
-        history = self._limits[secret_id]
-        
-        # 1. Prune attempts older than the window
-        while history and history[0] < (now - self.RATE_LIMIT_WINDOW):
-            history.popleft()
-            
-        # 2. Check if limit reached
-        if len(history) >= self.RATE_LIMIT_COUNT:
-            return False
-            
-        # 3. Record this attempt
-        history.append(now)
-        return True
+        now = int(time.time())
+        cutoff = now - int(self.RATE_LIMIT_WINDOW)
 
-    def generate_totp(self, secret: str, time_step: int = 30) -> str:
+        count = self.db.count_recent_totp_attempts(
+            secret_id=entry_id,
+            since_ts=cutoff
+        )
+
+        return count < self.RATE_LIMIT_COUNT
+
+    @staticmethod
+    def generate_totp( secret: str, time_step: int = 30) -> str:
         """
         Generate a 6-digit TOTP code for the current time.
 
@@ -84,8 +65,8 @@ class TOTPGenerator:
         except (TypeError, ValueError) as e:
             raise ValueError("Invalid TOTP secret. Must be a valid Base32 string.") from e
 
-
-    def get_time_remaining(self, time_step: int = 30) -> int:
+    @staticmethod
+    def get_time_remaining( time_step: int = 30) -> int:
         """
         Get seconds remaining until the current TOTP code expires.
 
@@ -98,32 +79,39 @@ class TOTPGenerator:
         current_time = int(time.time())
         return time_step - (current_time % time_step)
 
-    def is_valid_totp(self, secret: str, code: str, window: int = 1) -> bool:
-        """
-        Validate a TOTP code against the current time with a tolerance window.
+    def is_valid_totp(
+        self,
+        entry_id: str,
+        secret: str,
+        code: str,
+        window: int = 1
+    ) -> bool:
+        now = int(time.time())
 
-        Args:
-            secret: Base32 encoded TOTP secret key.
-            code: User provided TOTP code string.
-            window: Allowed window size for adjacent codes.
+        # 1. Check limit (do NOT record yet)
+        cutoff = now - int(self.RATE_LIMIT_WINDOW)
+        count = self.db.count_recent_totp_attempts(entry_id, cutoff)
 
-        Returns:
-            True if code is valid within tolerance.
-        """
-        # 1. Enforce Rate Limit
-        if not self._check_rate_limit(secret):
+        if count >= self.RATE_LIMIT_COUNT:
             raise RateLimitError(
                 f"Too many failed attempts. Please wait {int(self.RATE_LIMIT_WINDOW)}s."
             )
 
-        # 2. Verify Code
+        # 2. Verify TOTP
         try:
             totp = pyotp.TOTP(secret)
-            return totp.verify(code, valid_window=window)
+            ok = totp.verify(code, valid_window=window)
         except Exception:
-            return False
+            ok = False
 
-    def parse_totp_uri(self, uri: str) -> Optional[str]:
+        # 3. Record ONLY failed attempts
+        if not ok:
+            self.db.record_totp_attempt(entry_id, now)
+
+        return ok
+
+    @staticmethod
+    def parse_totp_uri( uri: str) -> Optional[str]:
         """
         Parse an otpauth:// URI and extract the secret key.
 
@@ -143,7 +131,8 @@ class TOTPGenerator:
         except Exception:
             return None
 
-    def generate_totp_uri(self, secret: str, issuer: str, account: str) -> str:
+    @staticmethod
+    def generate_totp_uri( secret: str, issuer: str, account: str) -> str:
         """
         Generate an otpauth:// URI for provisioning.
 

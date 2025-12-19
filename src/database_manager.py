@@ -7,13 +7,12 @@ import sqlite3
 import os
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
-from pathlib import Path
-import warnings
+import threading
 import re
 import json
 import uuid
 from src.config import DB_PATH, SCHEMA_PATH
-from src.crypto_engine import encrypt_entry, decrypt_entry, derive_master_key, generate_salt, generate_nonce, compute_auth_hash, compute_hmac, derive_hkdf_key
+from src.crypto_engine import encrypt_entry, decrypt_entry, generate_salt, derive_hkdf_key
 
 # ============ Validation Constants ============
 MAX_TITLE_LEN = 256
@@ -38,7 +37,7 @@ class DatabaseManager:
     """
     Manges SQLite database for SENTRA vault
 
-    Reponsibilities:
+    Responsibilities:
         - Database initialization and schema creation
         - Vault metadata CRUD operations
         - Entry CRUD operations with encrypted storage
@@ -60,6 +59,7 @@ class DatabaseManager:
         """
         self.db_path = db_path
         self.connection: Optional[sqlite3.Connection] = None
+        self._conn_lock = threading.Lock()
         # Ensure data directory exists
         directory = os.path.dirname(self.db_path)
         try:
@@ -75,25 +75,34 @@ class DatabaseManager:
     
     def connect(self) -> sqlite3.Connection:
         """ 
-        Create or return existing databse connection
+        Create or return existing database connection
         
         Returns:
             SQLite connection object with Row factory    
         """
-        if self.connection is None:
-            self.connection = sqlite3.connect(self.db_path)
-            self.connection.row_factory = sqlite3.Row
-            self.connection.execute("PRAGMA foreign_keys = ON")
+        with self._conn_lock:
+            if self.connection is not None:
+                return self.connection
+            if self.connection is None:
+                self.connection = sqlite3.connect(self.db_path)
+                self.connection.row_factory = sqlite3.Row
+                self.connection.execute("PRAGMA foreign_keys = ON")
 
-            # Try WAL mode directly on the main connection
-            res = self.connection.execute("PRAGMA journal_mode=WAL;").fetchone()
-            actual_mode = res[0] if res else None
+                # Try WAL mode directly on the main connection
+                res = self.connection.execute("PRAGMA journal_mode=WAL;").fetchone()
+                actual_mode = res[0].lower() if res else None
 
-            if actual_mode != "wal":
-                print("Warning: WAL mode unsupported, using DELETE journal mode.")
-                self.connection.execute("PRAGMA journal_mode=DELETE;")
+                if actual_mode != "wal":
+                    # Fallback to DELETE
+                    res = self.connection.execute("PRAGMA journal_mode=DELETE;").fetchone()
+                    fallback_mode = res[0].lower() if res else None
 
-        return self.connection
+                    if fallback_mode != "delete":
+                        raise RuntimeError(
+                            f"SQLite journaling misconfigured: WAL unsupported and DELETE fallback failed (mode={fallback_mode})"
+                        )
+
+            return self.connection
 
     def close(self):
         """
@@ -122,17 +131,8 @@ class DatabaseManager:
         """Context manager exit - auto-close"""
         self.close()
 
-    def _derive_entry_key(self, vault_key: bytes, entry_id:str, entry_salt: bytes) -> bytes:
-            """ 
-            Derive entry specific encryption key from vault key
-            
-            Args: 
-                - vault_key: 32-bytes vault key
-                - entry_id: Entry UUID string
-
-            Returns:
-                32-byte entry-specific key
-            """
+    @staticmethod
+    def _derive_entry_key(vault_key: bytes, entry_id:str, entry_salt: bytes) -> bytes:
             # Encrypt the entry_key
             return derive_hkdf_key(
                 master_key=vault_key,
@@ -140,35 +140,6 @@ class DatabaseManager:
                 salt=entry_salt,
                 length=32
             )
-    
-    def _validate_entry_data(
-        self, 
-        title: Optional[str] = None, 
-        url: Optional[str] = None, 
-        username: Optional[str] = None, 
-        notes: Optional[str] = None,
-        tags: Optional[str] = None,
-        category: Optional[str] = None
-    ):
-        """Helper to enforce strict length limits on entry data."""
-        if title is not None:
-            if not title or len(title) > MAX_TITLE_LEN:
-                raise ValueError(f"Title must be 1-{MAX_TITLE_LEN} characters.")
-        
-        if url and len(url) > MAX_URL_LEN:
-            raise ValueError(f"URL exceeds max length of {MAX_URL_LEN}.")
-            
-        if username and len(username) > MAX_USERNAME_LEN:
-            raise ValueError(f"Username exceeds max length of {MAX_USERNAME_LEN}.")
-            
-        if tags and len(tags) > MAX_TAGS_LEN:
-            raise ValueError(f"Tags exceed max length of {MAX_TAGS_LEN}.")
-            
-        if category and len(category) > MAX_CATEGORY_LEN:
-            raise ValueError(f"Category exceeds max length of {MAX_CATEGORY_LEN}.")
-            
-        if notes and len(notes) > MAX_NOTES_LEN:
-            raise ValueError(f"Notes exceed max length of {MAX_NOTES_LEN} characters.")
 
     def get_all_entries(self, vault_key: bytes) -> List[Dict]:
         """
@@ -179,17 +150,46 @@ class DatabaseManager:
             # Get all active IDs
             cursor = conn.execute("SELECT id FROM entries WHERE is_deleted = 0")
             rows = cursor.fetchall()
-            
+
             all_entries = []
             for row in rows:
                 # Reuse get_entry to handle key derivation and decryption safely
                 entry = self.get_entry(row["id"], vault_key)
                 if entry:
                     all_entries.append(entry)
-            
+
             return all_entries
         except Exception as e:
             raise DatabaseError(f"Failed to retrieve all entries: {e}")
+
+    @staticmethod
+    def _validate_entry_data(
+        title: Optional[str] = None,
+        url: Optional[str] = None,
+        username: Optional[str] = None,
+        notes: Optional[str] = None,
+        tags: Optional[str] = None,
+        category: Optional[str] = None
+    ):
+        """Helper to enforce strict length limits on entry data."""
+        if title is not None:
+            if not title or len(title) > MAX_TITLE_LEN:
+                raise ValueError(f"Title must be 1-{MAX_TITLE_LEN} characters.")
+
+        if url and len(url) > MAX_URL_LEN:
+            raise ValueError(f"URL exceeds max length of {MAX_URL_LEN}.")
+
+        if username and len(username) > MAX_USERNAME_LEN:
+            raise ValueError(f"Username exceeds max length of {MAX_USERNAME_LEN}.")
+
+        if tags and len(tags) > MAX_TAGS_LEN:
+            raise ValueError(f"Tags exceed max length of {MAX_TAGS_LEN}.")
+
+        if category and len(category) > MAX_CATEGORY_LEN:
+            raise ValueError(f"Category exceeds max length of {MAX_CATEGORY_LEN}.")
+
+        if notes and len(notes) > MAX_NOTES_LEN:
+            raise ValueError(f"Notes exceed max length of {MAX_NOTES_LEN} characters.")
 
     def initialize_database(self) -> bool:
         """
@@ -206,6 +206,7 @@ class DatabaseManager:
             - FileNotFoundError: schema.sql not found
             - sqlite3.Error: SQL execution failed
         """
+        conn = None
         try:
             conn = self.connect()
 
@@ -231,23 +232,6 @@ class DatabaseManager:
             vault_key_tag:bytes,
             kdf_config: Optional[Dict] = None
     ) -> bool:
-        """
-        Save vault initialization metadata to database
-
-        Args:
-            salt: 16-byte Argon2id salt
-            auth_hash: 32-byte PBKDF2-HMAC-SHA256 password verification hash
-            vault_key_encrypted: Encrypted vault key (32 bytes)
-            vault_key_nonce: 12-byte ChaCha20 nonce
-            vault_key_tag: 16-byte Poly1305 authentication tag
-        
-        Returns:
-            True if save successful
-            False if vault already initialized
-        
-        Raises:
-            DatabaseError: If database operation fails
-        """
         conn = self.connect()
 
         try:
@@ -290,6 +274,7 @@ class DatabaseManager:
         """
         Emergency rollback: delete vault metadata if initialization verification fails.
         """
+        conn = None
         try:
             conn = self.connect()
             conn.execute("BEGIN IMMEDIATE")
@@ -301,34 +286,6 @@ class DatabaseManager:
             raise DatabaseError(f"Critical failure: unable to rollback vault metadata: {e}") from e
         
     def load_vault_metadata(self) -> Optional[Dict]:
-        """
-        Load vault metadata from database
-
-        Returns:
-            Dictionary with vault configuration:
-            {
-                'salt': bytes,
-                'auth_hash': bytes,
-                'vault_key_encrypted': bytes,
-                'vault_key_nonce': bytes,
-                'vault_key_tag': bytes,
-                'created_at': str,
-                'last_unlocked_at': str,
-                'unlock_count': int,
-                'version': str
-            }
-            None if vault not initialized
-        Raises:
-            DatabaseError: If database operation fails
-        """
-        # TODO: Implement vault metadata load
-        # HINTS:
-        # 1. SELECT * FROM vault_metadata WHERE id = 1
-        # 2. If no row found, return None
-        # 3. Convert row to dictionary
-        # 4. Return dictionary with all fields
-        # 
-        # Note: sqlite3.Row objects can be accessed like dicts
         conn = self.connect()
 
         cursor = conn.execute("SELECT * FROM vault_metadata WHERE id = 1")
@@ -341,16 +298,6 @@ class DatabaseManager:
         return dict(row)
 
     def update_unlock_timestamp(self) -> bool:
-        """
-        Update last unlock timestamp and increment unlock counter
-
-        Returns:
-            True if update successful
-            False if vault not initialized
-
-        Raises:
-            DatabaseError: If database operation fails
-        """
         conn = self.connect()
         timestamp = datetime.now().isoformat()
 
@@ -381,25 +328,6 @@ class DatabaseManager:
             password_strength: int = 0,
             entry_id: Optional[str] = None
     ) -> str:
-        """ 
-        Add new encrypted entry to vault
-        
-        Args:
-            - vault_key: Vault encryption key 
-            - title: Entry title (plaintext, searchable)
-            - url: Optional[str] = Website URL (plaintext, searchable)
-            - username: Optional[str] = Username/email (plaintext, searchable)
-            - password: Optional[str] = Password (will be encrypted)
-            - notes: Optional[str] = Additional notes (will be encrypted)
-            - tags: Optional[str] = Comma-separated tags (plaintext, searchable)
-            - category: str = Entry category
-
-        Returns
-            - Entry UUID
-        
-        Raises:
-            DatabaseError: If database operation fails
-        """
         try:
             # Validate inputs
             if not title or not isinstance(title, str):
@@ -424,11 +352,19 @@ class DatabaseManager:
             
             # 1. Encrypt Password
             pw_payload = {"password": password or ""}
-            pw_cipher, pw_nonce, pw_tag = encrypt_entry(json.dumps(pw_payload), entry_key)
+            pw_cipher, pw_nonce, pw_tag = encrypt_entry(
+                json.dumps(pw_payload),
+                entry_key,
+                associated_data=entry_id.encode("utf-8")
+            )
             
             # 2. Encrypt Notes
             notes_payload = {"notes": notes or ""}
-            notes_cipher, notes_nonce, notes_tag = encrypt_entry(json.dumps(notes_payload), entry_key)
+            notes_cipher, notes_nonce, notes_tag = encrypt_entry(
+                json.dumps(notes_payload),
+                entry_key,
+                associated_data=entry_id.encode("utf-8")
+            )
             
             # Insert into entries
             conn = self.connect()
@@ -462,34 +398,7 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error during entry creation: {str(e)}")
     
-    def get_entry(self, entry_id: str, vault_key: bytes) -> Optional[Dict]:
-        """ 
-        Retrive and decrypt entry by ID
-        
-        Args:
-            - entry_id: Entry UUID
-            - vault_key: Vault encryption key
-            
-        Returns:
-            Dictionary with decrypted entry data:
-            {
-                'id': str,
-                'title': str,
-                'url': str,
-                'username': str,
-                'password': str,  # Decrypted
-                'notes': str,     # Decrypted
-                'tags': str,
-                'category': str,
-                'created_at': str,
-                'modified_at': str,
-                'last_accessed_at': str
-            }
-            None if entry not found or is deleted
-            
-        Raises:
-            - DatabaseError: If decryption fails
-        """
+    def get_entry(self, entry_id: str, vault_key: bytes, include_deleted: bool = False) -> Optional[Dict]:
         try:
             # Validate inputs
             if not entry_id or not isinstance(entry_id, str):
@@ -499,11 +408,13 @@ class DatabaseManager:
                 raise ValueError("Vault key must be 32 bytes")
             
             conn = self.connect()
-            
-            cursor = conn.execute(
-                "SELECT * FROM entries WHERE id = ? AND is_deleted = 0", 
-                (entry_id,)
-            )
+
+            if include_deleted:
+                sql = "SELECT * FROM entries WHERE id = ?"
+            else:
+                sql = "SELECT * FROM entries WHERE id = ? AND is_deleted = 0"
+
+            cursor = conn.execute(sql, (entry_id,))
             
             row = cursor.fetchone()
             
@@ -513,7 +424,7 @@ class DatabaseManager:
             try:
                 entry_salt = row["kdf_salt"]
             except IndexError:
-                # Handle legacy schema gracefully if needed, or fail safe
+                # Handle legacy schema gracefully if needed, or fail-safe
                 raise DatabaseError("Database integrity error: Missing salt for entry.")
 
             entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
@@ -524,11 +435,12 @@ class DatabaseManager:
                     row["password_encrypted"],
                     row["password_nonce"],
                     row["password_tag"],
-                    entry_key
+                    entry_key,
+                    associated_data=entry_id.encode("utf-8")
                 )
                 password_dict = json.loads(password_data)
                 password = password_dict.get("password")
-            except Exception as e:
+            except Exception:
                 raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}. Data may be tampered or corrupt.")
                 
             # Decrypt notes field
@@ -537,12 +449,12 @@ class DatabaseManager:
                     row["notes_encrypted"],
                     row["notes_nonce"],
                     row["notes_tag"],
-                    entry_key
+                    entry_key,
+                    associated_data=entry_id.encode("utf-8")
                 )
                 notes_dict = json.loads(notes_data)
                 notes = notes_dict.get("notes")
-            except Exception as e:
-                notes = None
+            except Exception:
                 raise DatabaseError(f"CRITICAL: Notes decryption failed for {entry_id}.")
             
             try:
@@ -572,6 +484,7 @@ class DatabaseManager:
                 "last_accessed_at": row["last_accessed_at"],
                 "password": password,
                 "notes": notes,
+                "is_deleted": bool(row["is_deleted"])
             }
             
             return entry
@@ -583,146 +496,68 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Unexpected error retrieving entry: {str(e)}")
 
-    def update_entry(
-            self,
-            entry_id: str, 
-            vault_key: bytes, 
-            title: Optional[str] = None,
-            url: Optional[str] = None, 
-            username: Optional[str] = None,
-            password: Optional[str] = None,
-            notes: Optional[str] = None, 
-            tags: Optional[str] = None, 
-            category: Optional[str] = None,
-            favorite: Optional[bool] = None,       
-            password_strength: Optional[int] = None
-    )->bool:
-        """ 
-        Update existing entry (only provided fields)
-
-        Args:
-            - entry_id: Entry UUID
-            - vault_key: Vault encryption key
-            - **kwargs: Fields to update (None = no change)
-
-        Returns:
-            - True if updated successfully
-            - False if entry not found
-
-        Raises:
-            DatabaseError: If database operation fails
-        """
+    def update_entry(self, entry_id: str, vault_key: bytes, **kwargs) -> Tuple[bool, int]:
+        conn = None
         try:
-            # Validate inputs
-            if not entry_id or not isinstance(entry_id, str):
-                raise ValueError("Entry ID must be a non-empty string")
-            
-            self._validate_entry_data(
-                title=title, url=url, username=username, 
-                notes=notes, tags=tags, category=category
-            )
-            
-            if not isinstance(vault_key, bytes) or len(vault_key) != 32:
-                raise ValueError("Vault key must be 32 bytes")
-            
+            if not entry_id: raise ValueError("Invalid ID")
             conn = self.connect()
-            
-            # Check if entry exists
+            conn.execute("BEGIN IMMEDIATE;")
+
             cursor = conn.execute(
                 "SELECT id, kdf_salt FROM entries WHERE id = ? AND is_deleted = 0",
                 (entry_id,)
             )
-
             row = cursor.fetchone()
-            
-            if row is None:
-                return (False, 0)  # Entry not found
-            
-            current_salt = row['kdf_salt']
-            
-            fields = []
-            values = []
-            
-            # Build update query dynamically
-            if title is not None:
-                fields.append("title = ?")
-                values.append(title)
-            
-            if url is not None:
-                fields.append("url = ?")
-                values.append(url)
-            
-            if username is not None:
-                fields.append("username = ?")
-                values.append(username)
-            
-            if tags is not None:
-                fields.append("tags = ?")
-                values.append(tags)
-            
-            if category is not None:
-                fields.append("category = ?")
-                values.append(category)
-            
-            if favorite is not None:
-                fields.append("favorite = ?")
-                values.append(1 if favorite else 0)
+            if not row:
+                conn.rollback()
+                return False, 0
 
-            if password_strength is not None:
-                if not isinstance(password_strength, int) or not (0 <= password_strength <= 100):
-                    raise ValueError("password_strength must be integer between 0 and 100")
-                fields.append("password_strength = ?")
-                values.append(password_strength)
+            fields, values = [], []
+            # Handle standard fields (title, url, etc.)
+            for key in ['title', 'url', 'username', 'tags', 'category', 'favorite']:
+                if key in kwargs and kwargs[key] is not None:
+                    fields.append(f"{key} = ?")
+                    values.append(kwargs[key] if key != 'favorite' else (1 if kwargs[key] else 0))
 
-            
-            # If password or notes changed, re-encrypt
-            if password is not None or notes is not None:
-                entry_key = self._derive_entry_key(vault_key, entry_id, current_salt)
-                
-                if password is not None:
-                    payload = {"password": password}
-                    payload_json = json.dumps(payload)
-                    ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+            # Handle sensitive fields (re-encryption required)
+            if any(k in kwargs for k in ['password', 'notes']):
+                entry_key = self._derive_entry_key(vault_key, entry_id, row['kdf_salt'])
+
+                if 'password' in kwargs:
+                    pw_json = json.dumps({"password": kwargs['password'] or ""})
+                    ct, nonce, tag = encrypt_entry(
+                        pw_json,
+                        entry_key,
+                        associated_data=entry_id.encode("utf-8")
+                    )
                     fields.extend(["password_encrypted = ?", "password_nonce = ?", "password_tag = ?"])
-                    values.extend([ciphertext, nonce, tag])
-                
-                if notes is not None:
-                    payload = {"notes": notes}
-                    payload_json = json.dumps(payload)
-                    ciphertext, nonce, tag = encrypt_entry(payload_json, entry_key)
+                    values.extend([ct, nonce, tag])
+
+                if 'notes' in kwargs:
+                    nt_json = json.dumps({"notes": kwargs['notes'] or ""})
+                    ct, nonce, tag = encrypt_entry(
+                        nt_json,
+                        entry_key,
+                        associated_data=entry_id.encode("utf-8")
+                    )
                     fields.extend(["notes_encrypted = ?", "notes_nonce = ?", "notes_tag = ?"])
-                    values.extend([ciphertext, nonce, tag])
-            
-            # If no fields to update, return False (indicates nothing happened)
+                    values.extend([ct, nonce, tag])
+
             if not fields:
-                return (False, 0)
-            
-            # Always update modified_at
+                conn.rollback()
+                return False, 0
+
             fields.append("modified_at = datetime('now')")
-            
-            # Build SQL correctly
-            set_clause = ", ".join(fields)
-            sql = f"UPDATE entries SET {set_clause} WHERE id = ?"
+            sql = f"UPDATE entries SET {', '.join(fields)} WHERE id = ?"
             values.append(entry_id)
 
-            # Ensure we hold a write lock to avoid race conditions
-            conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute(sql, tuple(values))
-            rows = cur.rowcount if hasattr(cur, "rowcount") else conn.total_changes
+            count = cur.rowcount
             conn.commit()
-            return (True, rows)
-            
-        except ValueError as e:
-            raise DatabaseError(f"Invalid input: {str(e)}")
-        except sqlite3.IntegrityError as e:
-            conn.rollback()
-            raise DatabaseError(f"Update violates constraints: {str(e)}")
-        except sqlite3.OperationalError as e:
-            conn.rollback()
-            raise DatabaseError(f"Database operation failed: {str(e)}")
+            return True, count
         except Exception as e:
-            conn.rollback()
-            raise DatabaseError(f"Unexpected error updating entry: {str(e)}") from e
+            if conn: conn.rollback()
+            raise DatabaseError(f"Update failed: {e}")
 
     def delete_entry(self, entry_id: str) -> bool:
         """
@@ -738,6 +573,7 @@ class DatabaseManager:
         Raises:
             DatabaseError: If database operation fails
         """
+        conn = None
         try:
             # Validate input
             if not entry_id or not isinstance(entry_id, str):
@@ -768,71 +604,56 @@ class DatabaseManager:
             conn.rollback()
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
-            conn.rollback()
+            if conn: conn.rollback()
             raise DatabaseError(f"Unexpected error deleting entry: {str(e)}")
 
     def list_entries(
-            self, 
-            include_deleted: bool = False, 
-            limit: int = 100, 
-            offset: int = 0
+            self,
+            include_deleted: bool = False,
+            category=None,
+            favorite=None,
+            limit: int = 100,
+            last_timestamp: str = None,  # Keyset: last seen modified_at
+            last_id: str = None  # Keyset: tie-breaker id
     ) -> List[Dict]:
-        """ 
-        List all entries (metadata only, no decryption)
-        
-        Args:
-            - include_deleted: Include soft-deleted entries in trash
-        
-        Returns:
-            - List of entry metadata dictionaries (passwords NOT decrypted)
-        """
         try:
             conn = self.connect()
-            
-            if limit > 1000:
-                raise ValueError("Limit exceeds maximum allowed (1000)")
-            if limit < 1:
-                limit = 1
-            if offset < 0:
-                offset = 0
+            if limit > 1000: limit = 1000
 
-            if include_deleted:
-                sql = """
-                    SELECT id, title, url, username, tags, category, created_at, modified_at, is_deleted, deleted_at
-                    FROM entries
-                    ORDER BY modified_at DESC
-                    LIMIT ? OFFSET ?
-                """
-            else:
-                sql = """
-                    SELECT id, title, url, username, tags, category, created_at, modified_at
-                    FROM entries
-                    WHERE is_deleted = 0
-                    ORDER BY modified_at DESC
-                    LIMIT ? OFFSET ?
-                """
-            
-            # Pass limit/offset safely as parameters
-            cursor = conn.execute(sql, (limit, offset))
+            conditions = []
+            params = []
+
+            if not include_deleted:
+                conditions.append("is_deleted = 0")
+            if category is not None:
+                conditions.append("category = ?")
+                params.append(category)
+            if favorite is not None:
+                conditions.append("favorite = ?")
+                params.append(1 if favorite else 0)
+
+            if last_timestamp and last_id:
+                conditions.append("(modified_at < ? OR (modified_at = ? AND id < ?))")
+                params.extend([last_timestamp, last_timestamp, last_id])
+
+            where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+            sql = f"""
+                SELECT id, title, url, username, tags, category, password_strength,
+                    created_at, modified_at, is_deleted
+                FROM entries
+                {where_clause}
+                ORDER BY modified_at DESC, id DESC
+                LIMIT ?
+            """
+            params.append(limit)
+
+            cursor = conn.execute(sql, tuple(params))
             return [dict(row) for row in cursor.fetchall()]
-            
-        except sqlite3.OperationalError as e:
-            raise DatabaseError(f"Database query failed: {str(e)}")
         except Exception as e:
-            raise DatabaseError(f"Unexpected error listing entries: {str(e)}")
+            raise DatabaseError(f"Unexpected error listing entries: {e}")
     
     def restore_entry(self, entry_id: str) -> bool:
-        """
-        Restore soft-deleted entry from trash
-        Trigger 'entries_au' automatically handles FTS re-indexing and Audit Log.
-
-        Args:
-            - entry_id: Entry UUID
-        
-        Returns:
-            - True if restored successfully
-            - False if entry not found in trash
-        """ 
+        conn = None
         try:
             # Validate input
             if not entry_id or not isinstance(entry_id, str):
@@ -864,10 +685,10 @@ class DatabaseManager:
         except ValueError as e:
             raise DatabaseError(f"Invalid input: {str(e)}")
         except sqlite3.OperationalError as e:
-            conn.rollback()
+            if conn: conn.rollback()
             raise DatabaseError(f"Database operation failed: {str(e)}")
         except Exception as e:
-            conn.rollback()
+            if conn: conn.rollback()
             raise DatabaseError(f"Unexpected error restoring entry: {str(e)}")
 
     def get_metadata(self, key: str) -> Optional[str]:
@@ -968,73 +789,34 @@ class DatabaseManager:
             
         except Exception as e:
             raise DatabaseError(f"Failed to fetch old entries: {e}")
-        
-    def search_entries(
-        self,
-        query: str,
-        include_deleted: bool = False,
-        limit: int = 50, 
-        offset: int =0
-    ) -> List[Dict]:
-        """
-        Search entries by title/URL/tags
-        
-        Args:
-            query: Search query
-            include_deleted: Include soft-deleted entries
-        
-        Returns:
-            List of matching entries (metadata only, not decrypted)
-        
-        Raises:
-            VaultLockedError: If vault locked
-            VaultError: If search fails
 
-        Security:
-        - Ensures vault unlocked before access.
-        - Uses parameterized queries to prevent SQL injection.
-        - Returns non-sensitive metadata only.
-        
-        """
+    def search_entries(
+            self,
+            query: str,
+            include_deleted: bool = False,
+            limit: int = 50,
+            offset: int = 0
+    ) -> List[Dict]:
         try:
-            if limit > 1000:
-                raise ValueError("Limit exceeds maximum allowed (1000)")
-            if limit < 1:
-                limit = 1
-            if offset < 0:
-                offset = 0
+            if limit > 1000: limit = 1000
+            if limit < 1: limit = 1
+            if offset < 0: offset = 0
 
             conn = self.connect()
             query = query.strip()
             if not query: return []
 
-            # 1. VALIDATION
             safe_token_pattern = re.compile(r'^[A-Za-z0-9._-]{1,30}$')
             terms = query.split()
-            
-            # 2. DECISION: Prefer FTS, fallback to LIKE for symbols
-            use_fts = True
-            
-            # If requesting trash, we MUST use LIKE (trash not in FTS)
-            if include_deleted:
-                use_fts = False
-            else:
-                # If query has symbols, FTS tokenizers might choke/strip them.
-                # Fallback to LIKE to ensure we find "C++" or "user@email".
-                for term in terms:
-                    if not term.isascii():
-                        use_fts = False
-                        break
-                    if not safe_token_pattern.match(term):
-                        use_fts = False
-                        break
+            use_fts = not include_deleted
 
-            # 3. EXECUTION
+            for term in terms:
+                if not term.isascii() or not safe_token_pattern.match(term):
+                    use_fts = False
+                    break
+
             if use_fts:
-                # --- FAST PATH (FTS) ---
                 fts_query = " ".join([f'"{t}"*' for t in terms])
-                
-                # FTS query structure is rigid, so we hardcode the filter
                 sql = """
                     SELECT e.id, e.title, e.url, e.username, e.tags, e.category, 
                            e.created_at, e.modified_at, e.is_deleted, e.password_strength
@@ -1045,46 +827,44 @@ class DatabaseManager:
                     LIMIT ? OFFSET ?
                 """
                 params = [fts_query, limit, offset]
-                
             else:
-                # --- ROBUST PATH (LIKE) ---
                 safe_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 wildcard = f"%{safe_query}%"
-                
-                # Construct WHERE clauses as a list to prevent logic errors
-                where_clauses = [
-                    r"(title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR "
-                    r"username LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')"
-                ]
-                
-                # Explicitly add deletion filter if needed
-                if not include_deleted:
-                    where_clauses.append("is_deleted = 0")
-                
-                # Join clauses safely
-                where_sql = " AND ".join(where_clauses)
-                
-                sql = f"""
+                # FIX: Use static SQL with a conditional filter for 'is_deleted'
+                sql = """
                     SELECT id, title, url, username, tags, category, 
                            created_at, modified_at, is_deleted, password_strength
                     FROM entries
-                    WHERE {where_sql}
+                    WHERE (title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR 
+                           username LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')
+                      AND (is_deleted = 0 OR ? = 1)
                     ORDER BY modified_at DESC
                     LIMIT ? OFFSET ?
                 """
-                
-                params = [wildcard, wildcard, wildcard, wildcard, limit, offset]
+                params = [wildcard, wildcard, wildcard, wildcard, 1 if include_deleted else 0, limit, offset]
 
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
-        
         except Exception as e:
             raise DatabaseError(f"Failed to search entries: {e}")
-        
-    def record_lockout_failure(self) -> None:
+
+    def list_entry_ids(self) -> List[str]:
+        """
+        Retrieve all active entry IDs (for backup purposes).
+        """
+        try:
+            conn = self.connect()
+            # Select all non-deleted IDs
+            cursor = conn.execute("SELECT id FROM entries WHERE is_deleted = 0")
+            return [row["id"] for row in cursor.fetchall()]
+        except Exception as e:
+            raise DatabaseError(f"Failed to list entry IDs: {e}")
+
+    def record_lockout_failure(self, retention_seconds: int = 3600, trim_limit: int = 100) -> None:
         """
         Record a failed attempt and prune history older than 1 hour.
         """
+        conn = None
         try:
             conn = self.connect()
             import time
@@ -1098,9 +878,21 @@ class DatabaseManager:
                 (now,)
             )
             # 2. Prune old entries to prevent table bloat (keep last 1 hour)
+            cutoff = now - retention_seconds
             conn.execute(
             "DELETE FROM lockout_attempts WHERE attempt_ts < ?",
-                (now - 3600,)
+                (cutoff,)
+            )
+            conn.execute(
+                f"""
+                            DELETE FROM lockout_attempts 
+                            WHERE id NOT IN (
+                                SELECT id FROM lockout_attempts 
+                                ORDER BY attempt_ts DESC 
+                                LIMIT ?
+                            )
+                            """,
+                (trim_limit,)
             )
             conn.commit()
         except Exception as e:
@@ -1125,6 +917,7 @@ class DatabaseManager:
         """
         Reset lockout history (e.g., after successful login or delay expiration).
         """
+        conn = None
         try:
             conn = self.connect()
             conn.execute("BEGIN IMMEDIATE;")
@@ -1133,3 +926,62 @@ class DatabaseManager:
         except Exception as e:
             conn.rollback()
             raise DatabaseError(f"Failed to clear lockout history: {e}") from e
+    
+    def record_totp_attempt(self, secret_id: str, ts: int) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO totp_attempts (secret_id, attempt_ts) VALUES (?, ?)",
+                (secret_id, ts)
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def count_recent_totp_attempts(self, secret_id: str, since_ts: int) -> int:
+        conn = self.connect()
+        cursor = conn.execute(
+            """
+            SELECT COUNT(*) 
+            FROM totp_attempts
+            WHERE secret_id = ? AND attempt_ts >= ?
+            """,
+            (secret_id, since_ts)
+        )
+        return int(cursor.fetchone()[0])
+    
+    def clear_totp_attempts(self, secret_id: str) -> None:
+        conn = self.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM totp_attempts WHERE secret_id = ?",
+            (secret_id,)
+        )
+        conn.commit()
+
+    def hard_delete_entry(self, entry_id: str) -> bool:
+        """
+        Permanently remove an entry from the database.
+        WARNING: This cannot be undone.
+        """
+        conn = None
+        try:
+            conn = self.connect()
+            conn.execute("BEGIN IMMEDIATE;")
+
+            # This triggers the 'entries_ad' trigger in schema.sql
+            # which automatically cleans up FTS index and adds an audit log.
+            cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+
+            if cursor.rowcount > 0:
+                conn.commit()
+                return True
+            else:
+                conn.rollback()
+                return False  # Entry not found
+
+        except Exception as e:
+            if conn: conn.rollback()
+            raise DatabaseError(f"Hard delete failed: {e}")
