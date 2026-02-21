@@ -1,0 +1,52 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Ganes\Desktop\Sentra\venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Ganes\Desktop\Sentra
+plugins: cov-7.0.0
+collecting ... collected 43 items
+
+tests/test_adaptive_lockout.py::TestInit::test_defaults_are_sane PASSED  [  2%]
+tests/test_adaptive_lockout.py::TestInit::test_custom_config_accepted PASSED [  4%]
+tests/test_adaptive_lockout.py::TestInit::test_non_int_config_raises PASSED [  6%]
+tests/test_adaptive_lockout.py::TestInit::test_zero_history_window_raises PASSED [  9%]
+tests/test_adaptive_lockout.py::TestInit::test_zero_hard_lockout_threshold_raises PASSED [ 11%]
+tests/test_adaptive_lockout.py::TestNoFailures::test_no_history_is_immediately_allowed PASSED [ 13%]
+tests/test_adaptive_lockout.py::TestSoftBackoff::test_one_failure_blocks_for_one_second PASSED [ 16%]
+tests/test_adaptive_lockout.py::TestSoftBackoff::test_two_failures_blocks_for_two_seconds PASSED [ 18%]
+tests/test_adaptive_lockout.py::TestSoftBackoff::test_three_failures_blocks_for_four_seconds PASSED [ 20%]
+tests/test_adaptive_lockout.py::TestSoftBackoff::test_delay_caps_at_max_delay PASSED [ 23%]
+tests/test_adaptive_lockout.py::TestSoftBackoff::test_expired_backoff_allows_attempt PASSED [ 25%]
+tests/test_adaptive_lockout.py::TestHardLockout::test_at_threshold_triggers_hard_lockout PASSED [ 27%]
+tests/test_adaptive_lockout.py::TestHardLockout::test_above_threshold_still_hard_locked PASSED [ 30%]
+tests/test_adaptive_lockout.py::TestHardLockout::test_hard_lockout_expires_allows_attempt PASSED [ 32%]
+tests/test_adaptive_lockout.py::TestHardLockout::test_custom_threshold PASSED [ 34%]
+tests/test_adaptive_lockout.py::TestSideEffects::test_record_failure_delegates_to_db PASSED [ 37%]
+tests/test_adaptive_lockout.py::TestSideEffects::test_reset_session_clears_history PASSED [ 39%]
+tests/test_adaptive_lockout.py::TestGetStatus::test_clean_state PASSED   [ 41%]
+tests/test_adaptive_lockout.py::TestGetStatus::test_soft_backoff_state PASSED [ 44%]
+tests/test_adaptive_lockout.py::TestGetStatus::test_hard_lockout_state PASSED [ 46%]
+tests/test_adaptive_lockout.py::TestGetStatus::test_get_status_message_alias PASSED [ 48%]
+tests/test_adaptive_lockout.py::TestVaultControllerIntegration::test_unlock_raises_account_locked_error_when_locked PASSED [ 51%]
+tests/test_adaptive_lockout.py::TestVaultControllerIntegration::test_account_locked_error_has_next_allowed_at PASSED [ 53%]
+tests/test_backup_manager.py::test_init_rejects_non_dict_hierarchy PASSED [ 55%]
+tests/test_backup_manager.py::test_init_rejects_missing_vault_key PASSED [ 58%]
+tests/test_backup_manager.py::test_init_rejects_bad_vault_key_length PASSED [ 60%]
+tests/test_backup_manager.py::test_init_rejects_equal_enc_and_hmac_keys PASSED [ 62%]
+tests/test_backup_manager.py::test_create_backup_success_all_entries PASSED [ 65%]
+tests/test_backup_manager.py::test_create_backup_with_selection PASSED   [ 67%]
+tests/test_backup_manager.py::test_create_backup_rejects_bad_vault_keys_tuple PASSED [ 69%]
+tests/test_backup_manager.py::test_create_backup_requires_internal_vault_key PASSED [ 72%]
+tests/test_backup_manager.py::test_create_backup_wraps_internal_errors PASSED [ 74%]
+tests/test_backup_manager.py::test_create_backup_v2_produces_encrypted_file PASSED [ 76%]
+tests/test_backup_manager.py::test_create_and_restore_v2_round_trip PASSED [ 79%]
+tests/test_backup_manager.py::test_restore_rejects_too_short_file PASSED [ 81%]
+tests/test_backup_manager.py::test_restore_rejects_invalid_header_len PASSED [ 83%]
+tests/test_backup_manager.py::test_restore_rejects_hmac_mismatch PASSED  [ 86%]
+tests/test_backup_manager.py::test_restore_rejects_unsupported_version PASSED [ 88%]
+tests/test_backup_manager.py::test_restore_rejects_entry_count_mismatch PASSED [ 90%]
+tests/test_backup_manager.py::test_restore_v1_still_works PASSED         [ 93%]
+tests/test_backup_manager.py::test_restore_backup_v2_success PASSED      [ 95%]
+tests/test_backup_manager.py::test_restore_phase1_error_raises_without_db_transaction PASSED [ 97%]
+tests/test_backup_manager.py::test_restore_phase2_db_failure_triggers_rollback PASSED [100%]
+
+============================= 43 passed in 0.44s ==============================

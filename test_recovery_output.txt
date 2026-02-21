@@ -1,0 +1,51 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Ganes\Desktop\Sentra\venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Ganes\Desktop\Sentra
+plugins: cov-7.0.0
+collecting ... collected 42 items
+
+tests/test_recovery_manager.py::TestCodeHelpers::test_generate_code_format PASSED [  2%]
+tests/test_recovery_manager.py::TestCodeHelpers::test_generate_code_random PASSED [  4%]
+tests/test_recovery_manager.py::TestCodeHelpers::test_normalise_strips_whitespace PASSED [  7%]
+tests/test_recovery_manager.py::TestSetupPassphrase::test_happy_path PASSED [  9%]
+tests/test_recovery_manager.py::TestSetupPassphrase::test_empty_passphrase_raises PASSED [ 11%]
+tests/test_recovery_manager.py::TestSetupPassphrase::test_whitespace_only_passphrase_raises PASSED [ 14%]
+tests/test_recovery_manager.py::TestSetupPassphrase::test_wrong_vault_key_size_raises PASSED [ 16%]
+tests/test_recovery_manager.py::TestSetupPassphrase::test_replaces_existing_passphrase PASSED [ 19%]
+tests/test_recovery_manager.py::TestSetupCodes::test_returns_correct_count PASSED [ 21%]
+tests/test_recovery_manager.py::TestSetupCodes::test_codes_unique PASSED [ 23%]
+tests/test_recovery_manager.py::TestSetupCodes::test_code_format PASSED  [ 26%]
+tests/test_recovery_manager.py::TestSetupCodes::test_replaces_existing_codes PASSED [ 28%]
+tests/test_recovery_manager.py::TestSetupCodes::test_invalid_count_raises PASSED [ 30%]
+tests/test_recovery_manager.py::TestSetupCodes::test_wrong_vault_key_size_raises PASSED [ 33%]
+tests/test_recovery_manager.py::TestRecoverWithPassphrase::test_correct_passphrase_returns_vault_key PASSED [ 35%]
+tests/test_recovery_manager.py::TestRecoverWithPassphrase::test_wrong_passphrase_raises PASSED [ 38%]
+tests/test_recovery_manager.py::TestRecoverWithPassphrase::test_no_passphrase_configured_raises PASSED [ 40%]
+tests/test_recovery_manager.py::TestRecoverWithPassphrase::test_passphrase_is_case_sensitive PASSED [ 42%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_correct_code_returns_vault_key PASSED [ 45%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_wrong_code_raises PASSED [ 47%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_no_codes_configured_raises PASSED [ 50%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_code_is_case_insensitive PASSED [ 52%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_code_whitespace_stripped PASSED [ 54%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_used_code_rejected_on_second_attempt PASSED [ 57%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_used_code_does_not_invalidate_other_codes PASSED [ 59%]
+tests/test_recovery_manager.py::TestRecoverWithCode::test_code_marked_used_in_db PASSED [ 61%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_status_disabled_when_empty PASSED [ 64%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_status_passphrase_only PASSED [ 66%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_status_codes_only PASSED [ 69%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_status_codes_decremented_after_use PASSED [ 71%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_status_both PASSED [ 73%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_disable_clears_all PASSED [ 76%]
+tests/test_recovery_manager.py::TestDisableAndStatus::test_disable_idempotent PASSED [ 78%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_setup_recovery_passphrase_requires_unlock PASSED [ 80%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_setup_recovery_codes_requires_unlock PASSED [ 83%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_setup_passphrase_roundtrip_via_controller PASSED [ 85%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_setup_codes_returns_list_via_controller PASSED [ 88%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_recover_vault_with_passphrase PASSED [ 90%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_recover_vault_with_code PASSED [ 92%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_recover_wrong_passphrase_raises PASSED [ 95%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_disable_recovery_via_controller PASSED [ 97%]
+tests/test_recovery_manager.py::TestVaultControllerRecovery::test_get_recovery_status_no_unlock_required PASSED [100%]
+
+============================= 42 passed in 6.47s ==============================

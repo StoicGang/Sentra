@@ -10,15 +10,26 @@ import getpass
 import sys
 import shlex
 import os
+from datetime import datetime
 from typing import Optional, List, Dict
 from enum import Enum
 
 # Project modules
 from src.vault_controller import (
-    VaultController, VaultError, VaultLockedError
+    VaultController, VaultError, VaultLockedError, AccountLockedError, VaultDestroyedError
+)
+from src.recovery_manager import (
+    RecoveryError, RecoveryNotEnabledError, RecoveryCredentialError
 )
 from src.password_generator import PasswordGenerator
 from src.totp_generator import TOTPGenerator
+from src.secure_display import (
+    timed_reveal,
+    clipboard_copy_with_clear,
+    clipboard_available,
+    REVEAL_DURATION_SECS,
+    CLIPBOARD_CLEAR_SECS,
+)
 
 # ============ Configuration Constants ============
 PROG = "sentra"
@@ -307,12 +318,12 @@ class SentraCLI:
                 print_error("Passwords don't match. Try again.")
                 continue
 
-            # An Attempt unlock (will create vault)
+            # Vault created — offer recovery setup
             try:
                 self.vault.unlock_vault(pw1, create_if_missing=True)
                 self.session_active = True
-                print_success("✓ Vault created and unlocked!")
-                print_info("Remember: Keep your master password safe!")
+                print_success("\n✓ Vault created and unlocked!")
+                self._setup_recovery_prompt()
                 return True
             except Exception as e:
                 print_error(f"Setup failed: {e}")
@@ -320,6 +331,86 @@ class SentraCLI:
 
         print_error("Too many failed attempts.")
         return False
+
+    def _setup_recovery_prompt(self) -> None:
+        """Offer optional recovery setup immediately after vault creation."""
+        print("\n" + "━"*50)
+        print(colors.info("🛡  ACCOUNT RECOVERY (Optional)"))
+        print("━"*50)
+        print("\nIf you forget your master password, recovery lets you")
+        print("regain access and set a new one.")
+        print(colors.warning(
+            "⚠  Sentra stores only the encrypted vault key.\n"
+            "   Your recovery credential is NEVER stored — keep it safe!"
+        ))
+        print("\n  [1] Recovery Passphrase — a memorable second passphrase")
+        print("  [2] One-Time Codes      — 8 printable codes (store offline)")
+        print("  [3] Skip               — No recovery (password cannot be recovered)")
+        print()
+
+        for _ in range(3):
+            choice = input("Choose [1/2/3]: ").strip()
+            if choice == "1":
+                self._do_setup_recovery_passphrase()
+                return
+            elif choice == "2":
+                self._do_setup_recovery_codes()
+                return
+            elif choice == "3":
+                print_info("Recovery skipped. Keep your master password safe!")
+                return
+            else:
+                print_error("Please enter 1, 2, or 3.")
+
+    def _do_setup_recovery_passphrase(self) -> None:
+        """Interactive setup for recovery passphrase."""
+        print("\nChoose a recovery passphrase — different from your master password.")
+        print("Use a memorable phrase you can write down and keep secure.")
+        for _ in range(3):
+            try:
+                rp1 = getpass.getpass("Recovery Passphrase: ")
+                if not rp1.strip():
+                    print_error("Passphrase cannot be empty.")
+                    continue
+                rp2 = getpass.getpass("Confirm Passphrase:   ")
+                if rp1 != rp2:
+                    print_error("Passphrases do not match.")
+                    continue
+                self.vault.setup_recovery_passphrase(rp1)
+                print_success("✓ Recovery passphrase saved. Store it somewhere safe.")
+                return
+            except (KeyboardInterrupt, EOFError):
+                print()
+                print_info("Recovery setup cancelled.")
+                return
+            except Exception as e:
+                print_error(f"Could not save recovery passphrase: {e}")
+        print_error("Too many attempts — recovery passphrase not saved.")
+
+    def _do_setup_recovery_codes(self, count: int = 8) -> None:
+        """Interactive setup for one-time recovery codes."""
+        try:
+            codes = self.vault.setup_recovery_codes(count)
+        except Exception as e:
+            print_error(f"Could not generate recovery codes: {e}")
+            return
+
+        print("\n" + "="*56)
+        print(colors.info("  YOUR ONE-TIME RECOVERY CODES"))
+        print("  Save these codes in a SECURE OFFLINE location:")
+        print("  (password manager, printed paper, safety deposit box)")
+        print("="*56)
+        for i, code in enumerate(codes, 1):
+            print(f"  {i:2d}.  {code}")
+        print("="*56)
+        print(colors.warning(
+            "  ⚠  Each code works ONCE only.  Sentra does not store them."
+        ))
+        print(colors.warning(
+            "  ⚠  Losing all codes = no recovery possible."
+        ))
+        print()
+        input("  Press Enter once you have saved these codes…")
 
     def _unlock_existing_vault(self) -> bool:
         """Unlock existing vault with adaptive lockout-friendly retry loop"""
@@ -329,6 +420,28 @@ class SentraCLI:
 
         attempt = 1
         while attempt <= MAX_UNLOCK_ATTEMPTS:
+            # Show current lockout status before prompting
+            try:
+                status = self.vault.adaptive_lockout.get_status()
+                if not status["allowed"]:
+                    # Already locked — handle AccountLockedError from vault directly,
+                    # but we can also surface it proactively before prompting.
+                    remaining = status["delay_seconds"]
+                    if status["hard_locked"]:
+                        next_at = status.get("next_allowed_at", "unknown")
+                        print_error(
+                            f"🔒 Account locked after too many failed attempts.\n"
+                            f"   Locked for {self._format_duration(remaining)}."
+                            + (f"\n   Try again after: {next_at}" if next_at else "")
+                        )
+                    else:
+                        print_error(
+                            f"⏳ Wait {self._format_duration(remaining)} before next attempt."
+                        )
+                    return False
+            except Exception:
+                pass  # Non-fatal: don't block unlock if status check fails
+
             try:
                 pw = getpass.getpass("Master Password: ")
             except (KeyboardInterrupt, EOFError):
@@ -345,20 +458,51 @@ class SentraCLI:
                 print_success("✓ Vault unlocked")
                 return True
 
-            except VaultLockedError as e:
-                # Adaptive lockout: inform user, allow retry after delay expires
-                print_error(str(e))
-                attempt += 1
-                continue
+            except VaultDestroyedError as e:
+                # Emergency exit for self-destruct trigger
+                print("\n" + "!" * 60)
+                print(colors.error("  CRITICAL SECURITY ALERT: VAULT DESTROYED"))
+                print(colors.error(f"  {e}"))
+                print("!" * 60 + "\n")
+                sys.exit(1)
+
+            except AccountLockedError as e:
+                # Brute-force lockout — show countdown and exit loop
+                if e.hard_locked:
+                    msg = (
+                        f"🔒 Account locked: too many failed attempts.\n"
+                        f"   Locked for {self._format_duration(e.delay_seconds)}."
+                    )
+                    if e.next_allowed_at:
+                        msg += f"\n   Try again after: {e.next_allowed_at}"
+                else:
+                    msg = (
+                        f"⏳ Rate-limited: wait {self._format_duration(e.delay_seconds)} "
+                        f"before retrying."
+                    )
+                print_error(msg)
+                return False
 
             except VaultError as e:
                 # Authentication failed or other vault problems
                 if "Invalid password" in str(e):
-                    # Give a short hint but don't force exit — adaptive lockout will throttle
-                    print_error("Invalid password. Try again (wait if you see a lockout message).")
+                    # Show remaining attempts before hard lockout
+                    try:
+                        status = self.vault.adaptive_lockout.get_status()
+                        soft_remaining = status.get("attempts_before_hard_lockout", 0)
+                        failures = status.get("failures", 0)
+                        if soft_remaining > 0:
+                            print_error(
+                                f"Invalid password ({failures} failed attempt{'s' if failures != 1 else ''}).\n"
+                                f"  ⚠  {soft_remaining} attempt{'s' if soft_remaining != 1 else ''} "
+                                f"remaining before 24h lockout."
+                            )
+                        else:
+                            print_error("Invalid password.")
+                    except Exception:
+                        print_error("Invalid password. Try again.")
                 else:
                     print_error(str(e))
-                    # If it's a non-auth VaultError, break to avoid a tight loop
                     return False
 
             except Exception as e:
@@ -369,6 +513,21 @@ class SentraCLI:
 
         print_error("Too many failed attempts. Exiting...")
         return False
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        """Convert seconds to a human-readable duration string."""
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs}s"
+        hours, mins = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h {mins}m"
+        days, hrs = divmod(hours, 24)
+        return f"{days}d {hrs}h"
 
 
     # ======== Command Handlers ========
@@ -575,10 +734,18 @@ class SentraCLI:
             pw = entry.get('password')
             if pw:
                 if args.show:
-                    print(f"  {colors.warning('Password:')} {pw}")
+                    # Timed reveal: password shown then erased from terminal
+                    print("=" * 60)
+                    timed_reveal(pw, label="Password", duration=REVEAL_DURATION_SECS)
+                    print("=" * 60)
                 else:
                     masked = "●" * 12
-                    print(f"  {colors.dim('Password:')} {masked} {colors.dim('(use --show to reveal)')}")
+                    print(f"  {colors.dim('Password:')} {masked} "
+                          f"{colors.dim('(use --show to reveal, --copy to copy)')}")
+
+                # Copy to clipboard
+                if getattr(args, 'copy', False):
+                    clipboard_copy_with_clear(pw, timeout=CLIPBOARD_CLEAR_SECS, label="Password")
 
                 # Show strength
                 strength = entry.get('password_strength', 0)
@@ -834,18 +1001,13 @@ class SentraCLI:
             print(f"  {password}\n")
             print(f"Score: {score}, Label: {label}")
 
-            # Offer to copy to clipboard (if available)
+            # Offer to copy to clipboard with auto-clear
             if args.copy:
-                try:
-                    import pyperclip
-                except ImportError:
-                    pyperclip = None
-
-                if pyperclip:
-                    pyperclip.copy(password)
-                    print_success("Password copied to clipboard!")
-                else:
-                    print_info("Install 'pyperclip' for clipboard support")
+                clipboard_copy_with_clear(
+                    password,
+                    timeout=CLIPBOARD_CLEAR_SECS,
+                    label="Generated password",
+                )
 
         except Exception as e:
             print_error(f"Password generation failed: {e}")
@@ -1002,6 +1164,65 @@ class SentraCLI:
         except Exception as e:
             print_error(f"Failed to retrieve audit log: {e}")
 
+    def cmd_self_destruct(self, args):
+        """Management for self-destruct feature"""
+        # 1. Config management (threshold/disable/status)
+        if args.threshold or args.disable or args.status:
+            if not self.ensure_unlocked():
+                return
+            
+            if args.threshold:
+                if args.threshold < 1:
+                    print_error("Threshold must be at least 1.")
+                    return
+                self.vault.set_config("auto_self_destruct_threshold", args.threshold)
+                print_success(f"✓ Auto-self-destruct enabled. Vault will wipe after {args.threshold} failed logins.")
+            
+            if args.disable:
+                self.vault.set_config("auto_self_destruct_threshold", None)
+                print_success("✓ Auto-self-destruct disabled.")
+                
+            if args.status:
+                threshold = self.vault.get_config("auto_self_destruct_threshold")
+                if threshold:
+                    print(f"\n{colors.info('Self-Destruct Status:')} {colors.warning('ENABLED')}")
+                    print(f"{colors.info('Threshold:')} {threshold} failed attempts")
+                else:
+                    print(f"\n{colors.info('Self-Destruct Status:')} {colors.success('DISABLED')}")
+            return
+
+        # 2. Manual activation
+        print("\n" + "!" * 60)
+        print(colors.error("  DANGER: MANUAL SELF-DESTRUCT"))
+        print(colors.error("  This will PERMANENTLY DELETE your entire password database."))
+        print(colors.error("  There is NO undo. Ensure you have an offline backup."))
+        print("!" * 60 + "\n")
+
+        # Double confirmation with master password
+        if not self.ensure_unlocked():
+            return
+
+        confirm1 = input("Type 'DESTROY' to confirm intent: ")
+        if confirm1.upper() != "DESTROY":
+            print_info("Action cancelled.")
+            return
+
+        print(colors.warning("\nFinal Warning: Database will be erased IMMEDIATELY."))
+        confirm2 = input("Type 'YES DELETE EVERYTHING' to finish: ")
+        if confirm2 != "YES DELETE EVERYTHING":
+            print_info("Action cancelled.")
+            return
+
+        try:
+            self.vault.self_destruct()
+        except VaultDestroyedError as e:
+            print("\n" + "!" * 60)
+            print(colors.error(f"  {e}"))
+            print("!" * 60 + "\n")
+            sys.exit(0)
+        except Exception as e:
+            print_error(f"Failed to self-destruct: {e}")
+
     def cmd_security(self, _=None):
         """Security health check"""
         if not self.ensure_unlocked():
@@ -1010,6 +1231,13 @@ class SentraCLI:
         print(f"\n{colors.info('=== Security Health Check ===')}\n")
 
         try:
+            # Check for self-destruct risk
+            sd_threshold = self.vault.get_config("auto_self_destruct_threshold")
+            if sd_threshold:
+                print(f"🔐 {colors.warning('NOTICE:')} Auto-self-destruct is ENABLED (Threshold: {sd_threshold} failures)")
+                print(f"   {colors.dim('The database will be deleted forever if login fails repeatedly.')}")
+                print()
+
             # Metadata-only listing
             entries = self.vault.list_entries()
 
@@ -1134,7 +1362,231 @@ class SentraCLI:
         except Exception as e:
             print_error(f"Export failed: {e}")
 
-    # ======== Parser & Dispatcher ========
+    # ======== Recovery Commands ========
+
+    def cmd_recover(self, args):
+        """
+        Recover vault access when master password is forgotten.
+        Does NOT require being unlocked. Prompts for recovery credential,
+        then sets a new master password.
+        """
+        if self.vault.is_unlocked:
+            print_error("Vault is already unlocked. Use this command only when locked out.")
+            return
+
+        # Check recovery is configured
+        try:
+            status = self.vault.get_recovery_status()
+        except Exception as e:
+            print_error(f"Could not check recovery status: {e}")
+            return
+
+        if not status["enabled"]:
+            print_error(
+                "No recovery is configured for this vault.\n"
+                "Recovery must be set up while the vault is unlocked."
+            )
+            return
+
+        print("\n" + "="*50)
+        print(colors.info("🔑 VAULT RECOVERY"))
+        print("="*50)
+        print(f"  Recovery type: {status['type']}")
+        if status["type"] in ("codes", "both"):
+            print(f"  Codes remaining: {status['codes_remaining']}/{status['codes_total']}")
+        print()
+
+        # Choose credential type
+        has_passphrase = status["type"] in ("passphrase", "both")
+        has_codes      = status["type"] in ("codes", "both")
+
+        if has_passphrase and has_codes:
+            print("  [1] Recovery Passphrase")
+            print("  [2] One-Time Code")
+            ctype_choice = input("  Choose [1/2]: ").strip()
+            credential_type = "passphrase" if ctype_choice == "1" else "code"
+        elif has_passphrase:
+            credential_type = "passphrase"
+        else:
+            credential_type = "code"
+
+        print()
+        try:
+            if credential_type == "passphrase":
+                credential = getpass.getpass("Recovery Passphrase: ")
+            else:
+                credential = input("Recovery Code (e.g. AAAAA-BBBBB-CCCCC-DDDDD): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+        if not credential:
+            print_error("Credential cannot be empty.")
+            return
+
+        # Prompt for new master password
+        print()
+        print_info("You will now set a new master password.")
+        for _ in range(3):
+            try:
+                np1 = getpass.getpass("New Master Password: ")
+                if len(np1) < MIN_PASSWORD_LENGTH:
+                    print_error(f"Too short — minimum {MIN_PASSWORD_LENGTH} characters.")
+                    continue
+                np2 = getpass.getpass("Confirm Password:    ")
+                if np1 != np2:
+                    print_error("Passwords do not match.")
+                    continue
+
+                self.vault.recover_vault(
+                    credential=credential,
+                    credential_type=credential_type,
+                    new_password=np1,
+                )
+                self.session_active = True
+                print_success("\n✓ Recovery successful! Vault unlocked with new master password.")
+                print_warning("  Set up fresh recovery credentials now (old codes/passphrase still work).")
+                return
+
+            except RecoveryCredentialError as e:
+                print_error(f"Invalid recovery credential: {e}")
+                return
+            except RecoveryNotEnabledError as e:
+                print_error(str(e))
+                return
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            except Exception as e:
+                print_error(f"Recovery failed: {e}")
+                return
+
+    def cmd_recovery(self, args):
+        """Manage account recovery settings (requires unlock)."""
+        if not self.ensure_unlocked():
+            return
+
+        subcmd = getattr(args, "subcmd", None) or "status"
+
+        if subcmd == "status":
+            self._recovery_show_status()
+
+        elif subcmd == "change":
+            ctype = getattr(args, "type", None)
+            if not ctype:
+                status = self.vault.get_recovery_status()
+                print("  [1] Recovery Passphrase")
+                print("  [2] One-Time Codes")
+                ctype_choice = input("  Choose type to (re)configure [1/2]: ").strip()
+                ctype = "passphrase" if ctype_choice == "1" else "codes"
+            if ctype == "passphrase":
+                self._do_setup_recovery_passphrase()
+            else:
+                self._do_setup_recovery_codes()
+
+        elif subcmd == "disable":
+            if confirm_action(
+                "Remove ALL recovery credentials? You will not be able to recover if you forget your password.",
+                dangerous=True,
+            ):
+                try:
+                    self.vault.disable_recovery()
+                    print_success("✓ Recovery disabled. All recovery credentials removed.")
+                except Exception as e:
+                    print_error(f"Could not disable recovery: {e}")
+        else:
+            print_error(f"Unknown recovery subcommand: {subcmd!r}.")
+            print_info("Usage: sentra recovery [status|change|disable]")
+
+    def _recovery_show_status(self) -> None:
+        """Print formatted recovery status."""
+        try:
+            s = self.vault.get_recovery_status()
+        except Exception as e:
+            print_error(f"Could not read recovery status: {e}")
+            return
+
+        print("\n" + "="*50)
+        print(colors.info("🛡  RECOVERY STATUS"))
+        print("="*50)
+        if not s["enabled"]:
+            print(colors.warning("  Recovery: NOT configured"))
+            print("  Run 'sentra recovery change' to set up recovery.")
+        else:
+            rtype = s["type"]
+            print(colors.success(f"  Recovery: Enabled ({rtype})"))
+            if rtype in ("codes", "both"):
+                remaining = s["codes_remaining"]
+                total     = s["codes_total"]
+                colour    = colors.success if remaining > 2 else colors.warning
+                print(colour(f"  Codes:    {remaining}/{total} remaining"))
+                if remaining == 0:
+                    print(colors.error(
+                        "  ⚠  All codes used — run 'sentra recovery change' to regenerate."
+                    ))
+        print()
+
+
+    def cmd_status(self, args):
+        """
+        Show current vault lock / brute-force protection status.
+        Does NOT require the vault to be unlocked and does NOT record a login attempt.
+        """
+        print("\n" + "="*50)
+        print(colors.info("🛡  VAULT STATUS"))
+        print("="*50)
+
+        # Vault session state
+        if self.vault.is_unlocked:
+            print(colors.success("  Session:  🔓 Unlocked"))
+        else:
+            print(colors.warning("  Session:  🔒 Locked"))
+
+        # Lockout state (reads DB, no side effects)
+        try:
+            status = self.vault.adaptive_lockout.get_status()
+        except Exception as e:
+            print_error(f"Could not read lockout state: {e}")
+            return
+
+        failures = status["failures"]
+        hard_locked = status["hard_locked"]
+        allowed = status["allowed"]
+        delay = status["delay_seconds"]
+        next_at = status.get("next_allowed_at")
+        remaining_soft = status.get("attempts_before_hard_lockout", 0)
+        threshold = self.vault.adaptive_lockout.hard_lockout_threshold
+
+        print(f"  Failures: {failures} (in last "
+              f"{self.vault.adaptive_lockout.history_window // 60} min window)")
+
+        if failures == 0:
+            print(colors.success("  Lockout:  None — no recent failed attempts"))
+        elif hard_locked:
+            print(colors.error(f"  Lockout:  🔒 HARD-LOCKED ({failures}/{threshold} failures)"))
+            if delay > 0:
+                print(colors.error(f"  Remaining: {self._format_duration(delay)}"))
+            if next_at:
+                print(colors.error(f"  Unlocks:  {next_at}"))
+        elif not allowed:
+            print(colors.warning(
+                f"  Lockout:  ⏳ Soft rate-limit active (backoff: {self._format_duration(delay)})"
+            ))
+            if next_at:
+                print(colors.warning(f"  Unlocks:  {next_at}"))
+            print(colors.warning(
+                f"  Warning:  {remaining_soft} attempt{'s' if remaining_soft != 1 else ''} "
+                f"remaining before 24h hard lockout"
+            ))
+        else:
+            if remaining_soft < threshold:
+                print(colors.warning(
+                    f"  Lockout:  ⚠  {failures} failed attempt{'s' if failures != 1 else ''} recorded. "
+                    f"{remaining_soft} more before hard lockout."
+                ))
+            else:
+                print(colors.success("  Lockout:  No lockout active"))
+        print()
 
     @staticmethod
     def build_parser() -> argparse.ArgumentParser:
@@ -1182,7 +1634,10 @@ class SentraCLI:
 
         get = subparsers.add_parser('get', help='Get entry details')
         get.add_argument('--title', '-t', help='Search by title')
-        get.add_argument('--show', '-s', action='store_true', help='Reveal password')
+        get.add_argument('--show', '-s', action='store_true',
+                         help=f'Timed reveal: show password for {REVEAL_DURATION_SECS}s then clear')
+        get.add_argument('--copy', '-c', action='store_true',
+                         help=f'Copy password to clipboard (auto-clears after {CLIPBOARD_CLEAR_SECS}s)')
 
         search = subparsers.add_parser('search', help='Search entries')
         search.add_argument('query', nargs='?', help='Search query')
@@ -1219,7 +1674,31 @@ class SentraCLI:
         imp = subparsers.add_parser('import', help='Import entries from an encrypted backup file')
         imp.add_argument('--input', '-i', help='Backup filename', required=True)
 
+        # ---- Account Recovery ----
+        subparsers.add_parser(
+            'recover',
+            help='Recover vault access when master password is forgotten (no unlock required)',
+        )
+
+        recovery = subparsers.add_parser(
+            'recovery',
+            help='Manage account recovery settings (status / change / disable)',
+        )
+        recovery.add_argument(
+            'subcmd',
+            nargs='?',
+            choices=['status', 'change', 'disable'],
+            default='status',
+            help='Recovery management action (default: status)',
+        )
+        recovery.add_argument(
+            '--type', choices=['passphrase', 'codes'],
+            help='Credential type for "change" subcommand',
+        )
+
         # ---- Security ----
+        subparsers.add_parser('status', help='Show vault and lockout status (no login required)')
+
         audit = subparsers.add_parser('audit', help='View security audit log')
         audit.add_argument('--limit', '-l', type=int, help='Number of entries to show')
 
@@ -1230,6 +1709,11 @@ class SentraCLI:
                                       help='Export to CSV (PLAINTEXT - use with caution)')
         export.add_argument('--output', '-o', help='Output filename')
 
+        sd = subparsers.add_parser('self-destruct', help='Configure or trigger vault self-destruct')
+        sd.add_argument('--threshold', '-t', type=int, help='Set auto-destruction threshold (failed logins)')
+        sd.add_argument('--disable', action='store_true', help='Disable auto-destruction')
+        sd.add_argument('--status', action='store_true', help='Show self-destruct configuration')
+
         return parser
 
     def dispatch(self, args):
@@ -1237,6 +1721,7 @@ class SentraCLI:
         handlers = {
             'login': lambda a: self.ensure_unlocked(),
             'lock': self.cmd_lock,
+            'status': self.cmd_status,
             'add': self.cmd_add,
             'list': self.cmd_list,
             'get': self.cmd_get,
@@ -1246,11 +1731,13 @@ class SentraCLI:
             'genpass': self.cmd_genpass,
             'totp': self.cmd_totp,
             'recover': self.cmd_recover,
+            'recovery': self.cmd_recovery,
             'backup': self.cmd_backup,
             'import': self.cmd_import,
             'audit': self.cmd_audit,
             'security': self.cmd_security,
-            'export': self.cmd_export
+            'export': self.cmd_export,
+            'self-destruct': self.cmd_self_destruct
         }
 
         if args.command in handlers:

@@ -1,0 +1,35 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Ganes\Desktop\Sentra\venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Ganes\Desktop\Sentra
+plugins: cov-7.0.0
+collecting ... collected 26 items
+
+tests/test_secure_display.py::TestDefaults::test_reveal_duration_positive PASSED [  3%]
+tests/test_secure_display.py::TestDefaults::test_clipboard_clear_positive PASSED [  7%]
+tests/test_secure_display.py::TestDefaults::test_reveal_duration_reasonable PASSED [ 11%]
+tests/test_secure_display.py::TestDefaults::test_clipboard_clear_reasonable PASSED [ 15%]
+tests/test_secure_display.py::TestTimedReveal::test_password_appears_in_output PASSED [ 19%]
+tests/test_secure_display.py::TestTimedReveal::test_label_appears_in_output PASSED [ 23%]
+tests/test_secure_display.py::TestTimedReveal::test_cleared_message_in_output PASSED [ 26%]
+tests/test_secure_display.py::TestTimedReveal::test_countdown_mentions_seconds PASSED [ 30%]
+tests/test_secure_display.py::TestTimedReveal::test_ctrl_c_clears_immediately PASSED [ 34%]
+tests/test_secure_display.py::TestTimedReveal::test_custom_label PASSED  [ 38%]
+tests/test_secure_display.py::TestTimedReveal::test_duration_zero_still_works PASSED [ 42%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_returns_true_on_success PASSED [ 46%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_text_is_copied PASSED [ 50%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_returns_false_when_pyperclip_missing PASSED [ 53%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_no_clipboard_prints_install_hint PASSED [ 57%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_success_message_printed PASSED [ 61%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_timer_registered PASSED [ 65%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_timer_is_daemon PASSED [ 69%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_clipboard_cleared_after_timeout PASSED [ 73%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_previous_timer_cancelled_on_new_copy PASSED [ 76%]
+tests/test_secure_display.py::TestClipboardCopyWithClear::test_copy_error_returns_false PASSED [ 80%]
+tests/test_secure_display.py::TestClipboardAvailable::test_returns_false_when_pyperclip_missing PASSED [ 84%]
+tests/test_secure_display.py::TestClipboardAvailable::test_returns_true_when_copy_works PASSED [ 88%]
+tests/test_secure_display.py::TestClipboardAvailable::test_returns_false_when_copy_raises PASSED [ 92%]
+tests/test_secure_display.py::TestTryImportPyperclip::test_returns_none_when_import_fails PASSED [ 96%]
+tests/test_secure_display.py::TestTryImportPyperclip::test_returns_module_when_available PASSED [100%]
+
+============================= 26 passed in 1.63s ==============================

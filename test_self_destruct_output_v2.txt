@@ -1,0 +1,23 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Ganes\Desktop\Sentra\venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Ganes\Desktop\Sentra
+plugins: cov-7.0.0
+collecting ... collected 5 items
+
+tests/test_self_destruct.py::TestSelfDestruct::test_manual_self_destruct_deletes_file PASSED [ 20%]
+tests/test_self_destruct.py::TestSelfDestruct::test_config_persistence PASSED [ 40%]
+tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_trigger FAILED [ 60%]
+tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_with_crypto_failure PASSED [ 80%]
+tests/test_self_destruct.py::TestSelfDestruct::test_self_destruct_clears_memory PASSED [100%]
+
+================================== FAILURES ===================================
+______________ TestSelfDestruct.test_auto_self_destruct_trigger _______________
+tests\test_self_destruct.py:69: in test_auto_self_destruct_trigger
+    assert "Invalid password" in str(exc.value)
+E   AssertionError: assert 'Invalid password' in 'Account locked due to too many failed attempts. Try again in 1 seconds.'
+E    +  where 'Account locked due to too many failed attempts. Try again in 1 seconds.' = str(AccountLockedError('Account locked due to too many failed attempts. Try again in 1 seconds.'))
+E    +    where AccountLockedError('Account locked due to too many failed attempts. Try again in 1 seconds.') = <ExceptionInfo AccountLockedError('Account locked due to too many failed attempts. Try again in 1 seconds.') tblen=2>.value
+=========================== short test summary info ===========================
+FAILED tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_trigger
+========================= 1 failed, 4 passed in 4.78s =========================

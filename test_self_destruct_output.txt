@@ -1,0 +1,106 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Ganes\Desktop\Sentra\venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Ganes\Desktop\Sentra
+plugins: cov-7.0.0
+collecting ... collected 5 items
+
+tests/test_self_destruct.py::TestSelfDestruct::test_manual_self_destruct_deletes_file ERROR [ 20%]
+tests/test_self_destruct.py::TestSelfDestruct::test_config_persistence ERROR [ 40%]
+tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_trigger ERROR [ 60%]
+tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_with_crypto_failure ERROR [ 80%]
+tests/test_self_destruct.py::TestSelfDestruct::test_self_destruct_clears_memory ERROR [100%]
+
+=================================== ERRORS ====================================
+__ ERROR at setup of TestSelfDestruct.test_manual_self_destruct_deletes_file __
+src\database_manager.py:908: in get_lockout_history
+    cursor = conn.execute(
+E   sqlite3.OperationalError: no such table: lockout_attempts
+
+The above exception was the direct cause of the following exception:
+tests\test_self_destruct.py:18: in temp_vault
+    controller.unlock_vault("MasterPass123!", create_if_missing=True)
+src\vault_controller.py:166: in unlock_vault
+    allowed, delay = self.adaptive_lockout.check_and_delay()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\adaptive_lockout.py:94: in check_and_delay
+    timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\database_manager.py:914: in get_lockout_history
+    raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
+E   src.database_manager.DatabaseError: Failed to retrieve lockout history: no such table: lockout_attempts
+_________ ERROR at setup of TestSelfDestruct.test_config_persistence __________
+src\database_manager.py:908: in get_lockout_history
+    cursor = conn.execute(
+E   sqlite3.OperationalError: no such table: lockout_attempts
+
+The above exception was the direct cause of the following exception:
+tests\test_self_destruct.py:18: in temp_vault
+    controller.unlock_vault("MasterPass123!", create_if_missing=True)
+src\vault_controller.py:166: in unlock_vault
+    allowed, delay = self.adaptive_lockout.check_and_delay()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\adaptive_lockout.py:94: in check_and_delay
+    timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\database_manager.py:914: in get_lockout_history
+    raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
+E   src.database_manager.DatabaseError: Failed to retrieve lockout history: no such table: lockout_attempts
+_____ ERROR at setup of TestSelfDestruct.test_auto_self_destruct_trigger ______
+src\database_manager.py:908: in get_lockout_history
+    cursor = conn.execute(
+E   sqlite3.OperationalError: no such table: lockout_attempts
+
+The above exception was the direct cause of the following exception:
+tests\test_self_destruct.py:18: in temp_vault
+    controller.unlock_vault("MasterPass123!", create_if_missing=True)
+src\vault_controller.py:166: in unlock_vault
+    allowed, delay = self.adaptive_lockout.check_and_delay()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\adaptive_lockout.py:94: in check_and_delay
+    timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\database_manager.py:914: in get_lockout_history
+    raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
+E   src.database_manager.DatabaseError: Failed to retrieve lockout history: no such table: lockout_attempts
+_ ERROR at setup of TestSelfDestruct.test_auto_self_destruct_with_crypto_failure _
+src\database_manager.py:908: in get_lockout_history
+    cursor = conn.execute(
+E   sqlite3.OperationalError: no such table: lockout_attempts
+
+The above exception was the direct cause of the following exception:
+tests\test_self_destruct.py:18: in temp_vault
+    controller.unlock_vault("MasterPass123!", create_if_missing=True)
+src\vault_controller.py:166: in unlock_vault
+    allowed, delay = self.adaptive_lockout.check_and_delay()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\adaptive_lockout.py:94: in check_and_delay
+    timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\database_manager.py:914: in get_lockout_history
+    raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
+E   src.database_manager.DatabaseError: Failed to retrieve lockout history: no such table: lockout_attempts
+_____ ERROR at setup of TestSelfDestruct.test_self_destruct_clears_memory _____
+src\database_manager.py:908: in get_lockout_history
+    cursor = conn.execute(
+E   sqlite3.OperationalError: no such table: lockout_attempts
+
+The above exception was the direct cause of the following exception:
+tests\test_self_destruct.py:18: in temp_vault
+    controller.unlock_vault("MasterPass123!", create_if_missing=True)
+src\vault_controller.py:166: in unlock_vault
+    allowed, delay = self.adaptive_lockout.check_and_delay()
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\adaptive_lockout.py:94: in check_and_delay
+    timestamps = self.dbmanager.get_lockout_history(since_timestamp=cutoff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\database_manager.py:914: in get_lockout_history
+    raise DatabaseError(f"Failed to retrieve lockout history: {e}") from e
+E   src.database_manager.DatabaseError: Failed to retrieve lockout history: no such table: lockout_attempts
+=========================== short test summary info ===========================
+ERROR tests/test_self_destruct.py::TestSelfDestruct::test_manual_self_destruct_deletes_file
+ERROR tests/test_self_destruct.py::TestSelfDestruct::test_config_persistence
+ERROR tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_trigger
+ERROR tests/test_self_destruct.py::TestSelfDestruct::test_auto_self_destruct_with_crypto_failure
+ERROR tests/test_self_destruct.py::TestSelfDestruct::test_self_destruct_clears_memory
+============================== 5 errors in 0.67s ==============================

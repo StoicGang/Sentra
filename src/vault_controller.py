@@ -3,12 +3,15 @@ SENTRA vault Controller
 Managers vault unlock/lock lifecycle and entry operations with hierarchical key management
 """
 
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from datetime import datetime, timezone
 import warnings
 import json
 from src.adaptive_lockout import AdaptiveLockout
 from src.backup_manager import BackupManager
+from src.recovery_manager import (
+    RecoveryManager, RecoveryError, RecoveryNotEnabledError, RecoveryCredentialError
+)
 from src.crypto_engine import (
     derive_master_key,
     compute_auth_hash, 
@@ -32,6 +35,19 @@ class VaultLockedError(VaultError):
     """Raised when trying to access vault while locked"""
     pass
 
+class AccountLockedError(VaultError):
+    """
+    Raised when the account is locked due to too many failed login attempts.
+    Distinct from VaultLockedError (vault not explicitly unlocked in session)
+    so the CLI can display a lockout countdown instead of a generic lock message.
+    """
+    def __init__(self, message: str, delay_seconds: int = 0, hard_locked: bool = False,
+                 next_allowed_at: str = None):
+        super().__init__(message)
+        self.delay_seconds = delay_seconds
+        self.hard_locked = hard_locked
+        self.next_allowed_at = next_allowed_at
+
 class CriticalVaultError(VaultError):
     """Raised for unrecoverable secure-memory or crypto failures."""
     pass
@@ -39,6 +55,10 @@ class CriticalVaultError(VaultError):
 
 class VaultAlreadyUnlockedError(ValueError):
     """Raised when trying to unlock already unlocked vault"""
+    pass
+
+class VaultDestroyedError(VaultError):
+    """Raised when the vault database has been physically deleted (self-destructed)."""
     pass
 
 class VaultController:
@@ -145,7 +165,14 @@ class VaultController:
 
             allowed, delay = self.adaptive_lockout.check_and_delay()
             if not allowed:
-                raise VaultLockedError(f"Vault is temporarily locked due to failed attempts. Try again in {delay} seconds.")
+                status = self.adaptive_lockout.get_status()
+                raise AccountLockedError(
+                    f"Account locked due to too many failed attempts. "
+                    f"Try again in {delay} seconds.",
+                    delay_seconds=delay,
+                    hard_locked=status.get("hard_locked", False),
+                    next_allowed_at=status.get("next_allowed_at"),
+                )
 
             if not password or not isinstance(password, str):
                 raise VaultError("Password must be a non-empty string")
@@ -289,6 +316,15 @@ class VaultController:
                 if not ok:
                     # record failure and surface a clear error
                     self.adaptive_lockout.record_failure()
+
+                    # NEW: Auto self-destruct trigger
+                    threshold = self.get_config("auto_self_destruct_threshold")
+                    if threshold is not None:
+                        # check failures
+                        status = self.adaptive_lockout.get_status()
+                        if status["failures"] >= int(threshold):
+                            self.self_destruct()
+
                     raise VaultError("Invalid password")
 
                 # Derive Master Key only after auth succeeds
@@ -314,6 +350,14 @@ class VaultController:
                     vault_key = bytes.fromhex(vault_key_dict["vault_key"])
                 except Exception as e:
                     self.adaptive_lockout.record_failure()
+
+                    # NEW: Auto self-destruct trigger (also on crypto failure)
+                    threshold = self.get_config("auto_self_destruct_threshold")
+                    if threshold is not None:
+                        status = self.adaptive_lockout.get_status()
+                        if status["failures"] >= int(threshold):
+                            self.self_destruct()
+
                     # Do not reset lockout history here — treat as a cryptographic failure
                     raise VaultError("Invalid password or vault corrupted.") from e
 
@@ -479,6 +523,49 @@ class VaultController:
             if errors:
                 raise CriticalVaultError(f"Partial lock state! Security warning: {', '.join(errors)}")
             return True
+
+    def self_destruct(self) -> None:
+        """
+        Permanently and physically delete the entire vault database.
+        This is IRREVERSIBLE.
+        """
+        import os
+        db_path = self.db.db_path
+
+        # 1. First lock to clear memory
+        self.lock_vault()
+
+        # 2. Close database connection
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+        # 3. Physically delete the file
+        if os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+            except Exception as e:
+                raise CriticalVaultError(f"Self-destruct failed while deleting file: {e}")
+
+        # 4. Burn the bridges
+        raise VaultDestroyedError(
+            "CRITICAL: The vault has self-destructed. The database file has been deleted."
+        )
+
+    def get_config(self, key: str) -> Optional[Any]:
+        """Retrieve a persistent application configuration value."""
+        try:
+            return self.db.get_metadata(key)
+        except Exception:
+            return None
+
+    def set_config(self, key: str, value: Any) -> bool:
+        """Persist an application configuration value."""
+        try:
+            return self.db.update_metadata(key, value)
+        except Exception:
+            return False
     
     def add_password(
         self,
@@ -766,3 +853,189 @@ class VaultController:
 
         except Exception as e:
             raise VaultError(f"Failed to read CSV file: {e}")
+
+    # ================================================================
+    # Account Recovery
+    # ================================================================
+
+    @property
+    def recovery_manager(self) -> RecoveryManager:
+        """Lazily instantiated RecoveryManager (uses same DatabaseManager)."""
+        if not hasattr(self, "_recovery_manager"):
+            self._recovery_manager = RecoveryManager(self.db)
+        return self._recovery_manager
+
+    def setup_recovery_passphrase(self, passphrase: str) -> None:
+        """
+        Encrypt the vault key under an Argon2id-derived passphrase key and
+        store it in vault_recovery.  Requires vault to be unlocked.
+
+        Args:
+            passphrase: The user's chosen recovery passphrase (non-empty).
+
+        Raises:
+            VaultLockedError: Vault is not unlocked.
+            ValueError:       Empty passphrase.
+            RecoveryError / DatabaseError: On crypto or DB failure.
+        """
+        self._check_unlocked()
+        with self._state_lock:
+            vault_key = bytes(self.vault_key_secure)
+        self.recovery_manager.setup_passphrase(vault_key, passphrase)
+
+    def setup_recovery_codes(self, count: int = 8) -> list:
+        """
+        Generate one-time recovery codes and encrypt vault_key under each.
+        Requires vault to be unlocked.
+
+        Args:
+            count: Number of codes to generate (1–16).
+
+        Returns:
+            List of plaintext code strings — user must store these offline.
+
+        Raises:
+            VaultLockedError: Vault is not unlocked.
+            ValueError:       Invalid count.
+            RecoveryError / DatabaseError: On failure.
+        """
+        self._check_unlocked()
+        with self._state_lock:
+            vault_key = bytes(self.vault_key_secure)
+        return self.recovery_manager.setup_codes(vault_key, count)
+
+    def recover_vault(self, credential: str, credential_type: str,
+                      new_password: str) -> bool:
+        """
+        Recover access to the vault without the master password.
+
+        Steps:
+          1. Verify credential (passphrase or code) and decrypt vault_key.
+          2. Derive a new master key from new_password + fresh salt.
+          3. Re-encrypt vault_key under the new master key.
+          4. Update vault_metadata (salt, auth_hash, encrypted vault key).
+          5. Unlock the vault in the current session.
+
+        Args:
+            credential:      The recovery passphrase or a one-time code.
+            credential_type: 'passphrase' or 'code'.
+            new_password:    New master password to set.
+
+        Returns:
+            True on success.
+
+        Raises:
+            VaultError:              On bad new_password or metadata problems.
+            RecoveryNotEnabledError: No matching recovery is configured.
+            RecoveryCredentialError: Wrong or used credential.
+        """
+        if self.is_unlocked:
+            raise VaultError("Vault is already unlocked. Lock it before recovering.")
+        if not new_password or len(new_password) < 1:
+            raise VaultError("New password must be a non-empty string.")
+
+        # Step 1: Recover vault_key using the supplied credential
+        if credential_type == "passphrase":
+            vault_key = self.recovery_manager.recover_with_passphrase(credential)
+        elif credential_type == "code":
+            vault_key = self.recovery_manager.recover_with_code(credential)
+        else:
+            raise VaultError(f"Unknown credential_type: {credential_type!r}.")
+
+        # Step 2–3: Derive new master key and re-encrypt vault_key
+        kdf_params = {
+            "algorithm": "argon2id",
+            "time_cost": 3,
+            "memory_cost": 64 * 1024,
+            "parallelism": 1,
+            "salt_len": 16,
+            "hash_len": 32,
+        }
+        new_salt = generate_salt(kdf_params["salt_len"])
+        new_master_key = derive_master_key(
+            password=new_password,
+            salt=new_salt,
+            time_cost=kdf_params["time_cost"],
+            memory_cost=kdf_params["memory_cost"],
+            parallelism=kdf_params["parallelism"],
+            hash_len=kdf_params["hash_len"],
+        )
+        vault_key_json = json.dumps({"vault_key": vault_key.hex()})
+        new_auth_hash = compute_auth_hash(new_password, new_salt)
+        ciphertext, nonce, tag = encrypt_entry(
+            plaintext=vault_key_json,
+            key=new_master_key,
+            associated_data=b"vault-key-v1",
+        )
+
+        # Step 4: Persist to DB (replaces the old master-password-encrypted vault key)
+        try:
+            conn = self.db.connect()
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                UPDATE vault_metadata SET
+                    salt = ?, auth_hash = ?,
+                    vault_key_encrypted = ?, vault_key_nonce = ?, vault_key_tag = ?,
+                    kdf_config = ?
+                WHERE id = 1
+                """,
+                (
+                    new_salt, new_auth_hash,
+                    ciphertext, nonce, tag,
+                    json.dumps(kdf_params),
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise VaultError(f"Failed to update vault metadata during recovery: {e}") from e
+
+        # Step 5: Unlock the session immediately with the recovered vault_key
+        # Re-use the secure-memory path by simulating a normal unlock flow
+        try:
+            master_buf = bytearray(new_master_key)
+            vault_buf  = bytearray(vault_key)
+            del new_master_key, vault_key
+
+            self.master_key_handle = self.secure_mem.lock_memory(master_buf)
+            self.vault_key_handle  = self.secure_mem.lock_memory(vault_buf)
+
+            self.master_key_secure = master_buf
+            self.vault_key_secure  = vault_buf
+            self.is_unlocked = True
+            self.unlock_timestamp = datetime.now(timezone.utc).isoformat()
+
+            try:
+                self.db.update_unlock_timestamp()
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            raise VaultError(f"Recovery succeeded but session unlock failed: {e}") from e
+
+    def disable_recovery(self) -> None:
+        """
+        Remove all recovery credentials.  Requires vault to be unlocked.
+
+        Raises:
+            VaultLockedError: Vault is not unlocked.
+            DatabaseError:    On DB failure.
+        """
+        self._check_unlocked()
+        self.recovery_manager.disable_recovery()
+
+    def get_recovery_status(self) -> dict:
+        """
+        Return the current recovery configuration status.
+        Does NOT require the vault to be unlocked.
+
+        Returns:
+            {enabled, type, codes_total, codes_remaining}
+        """
+        return self.recovery_manager.get_status()

@@ -140,6 +140,33 @@ END;
 
 
 -- ============================================================================
+-- TABLE 7: vault_recovery (Account Recovery)
+-- ============================================================================
+-- Stores encrypted copies of the vault key, one row per recovery credential.
+-- The vault key is encrypted under a key derived from the user's credential:
+--   passphrase: Argon2id(passphrase, kdf_salt) → ChaCha20-Poly1305(vault_key)
+--   code:       HKDF(code, kdf_salt, info) → ChaCha20-Poly1305(vault_key)
+-- Verifier = HMAC-SHA256(derived_key, b"sentra-recovery-verify") for fast
+-- wrong-code rejection without exposing the decrypted vault_key.
+-- Plaintext credentials are NEVER stored here.
+CREATE TABLE IF NOT EXISTS vault_recovery (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT NOT NULL CHECK (type IN ('passphrase', 'code')),
+    code_index  INTEGER,                -- NULL for passphrase; 0..N for codes
+    kdf_salt    BLOB NOT NULL,          -- Random 16-byte salt per row
+    nonce       BLOB NOT NULL,          -- ChaCha20-Poly1305 12-byte nonce
+    ciphertext  BLOB NOT NULL,          -- Encrypted vault_key bytes
+    tag         BLOB NOT NULL,          -- Poly1305 16-byte authentication tag
+    verifier    BLOB,                   -- HMAC-SHA256 for fast reject
+    used        INTEGER DEFAULT 0 CHECK (used IN (0, 1)),
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_recovery_type
+ON vault_recovery(type, used);
+
+
+-- ============================================================================
 -- INDEXES (Performance)
 -- ============================================================================
 CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title);
