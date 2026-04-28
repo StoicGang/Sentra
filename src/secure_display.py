@@ -16,11 +16,14 @@ from __future__ import annotations
 import sys
 import time
 import threading
+import os
+import ctypes
 from typing import Optional
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
-REVEAL_DURATION_SECS: int = 20    # seconds a revealed password stays visible
-CLIPBOARD_CLEAR_SECS: int = 30    # seconds before clipboard auto-wipe
+# ─── Defaults ────────────────────────────────────────────────────────────────
+REVEAL_DURATION_SECS: int = 60    # seconds a revealed password stays visible
+CLIPBOARD_CLEAR_SECS: int = 45    # seconds before clipboard auto-wipe
 
 # ─── Colour constants (simple ANSI; no external dep) ─────────────────────────
 _ANSI_RESET  = "\x1b[0m"
@@ -33,10 +36,39 @@ _CR          = "\r"            # return to start of line
 
 # Whether the terminal supports ANSI (simplistic check)
 _ANSI_OK: bool = sys.stdout.isatty() and sys.platform != "win32" or (
-    sys.platform == "win32" and "ANSICON" in __import__("os").environ
-    or __import__("os").environ.get("TERM_PROGRAM") in ("vscode", "mintty")
-    or __import__("os").environ.get("WT_SESSION") is not None  # Windows Terminal
+    sys.platform == "win32" and "ANSICON" in os.environ
+    or os.environ.get("TERM_PROGRAM") in ("vscode", "mintty")
+    or os.environ.get("WT_SESSION") is not None  # Windows Terminal
 )
+
+def init_windows_ansi() -> bool:
+    """
+    Explicitly enable VT100 processing in Windows Console (cmd.exe / PowerShell).
+    Returns True on success.
+    """
+    if sys.platform != "win32":
+        return True
+
+    # https://docs.microsoft.com/en-us/windows/console/setconsolemode
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    STD_OUTPUT_HANDLE = -11
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+            
+        mode.value |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if not kernel32.SetConsoleMode(handle, mode):
+            return False
+            
+        global _ANSI_OK
+        _ANSI_OK = True
+        return True
+    except Exception:
+        return False
 
 
 def _erase_current_line() -> None:
@@ -74,38 +106,31 @@ def timed_reveal(
 ) -> None:
     """
     Print `password` with `label`, then count down and erase it from the
-    terminal after `duration` seconds.  Pressing Ctrl-C clears immediately.
-
-    Args:
-        password: The plaintext password to display.
-        label:    Column label shown alongside the password.
-        duration: Seconds to leave the password visible (default 20).
+    terminal after `duration` seconds. BLOCKING.
     """
     # Print the password line
     pw_line = f"  {_yellow(label + ':')} {password}"
     print(pw_line)
 
-    # Separator so the status line sits on its own row
     status_prefix = "  "
     try:
         for remaining in range(duration, 0, -1):
-            msg = (
-                f"{status_prefix}{_dim(f'(screen clears in {remaining}s — press Ctrl-C to clear now)')}"
-            )
+            msg = f"{status_prefix}{_dim(f'(screen clears in {remaining}s — press Ctrl-C to clear now)')}"
             sys.stdout.write(f"{_CR}{msg}")
             sys.stdout.flush()
             time.sleep(1)
     except KeyboardInterrupt:
         pass  # user pressed Ctrl-C — fall through to clear
     finally:
-        # Move up one line and erase the password line, then erase status line
-        # Move cursor up 1 line (only for terminals that support it)
+        # Erase the reveal line and status line
         if _ANSI_OK:
             sys.stdout.write(f"\x1b[1A")   # cursor up 1
-        _erase_current_line()
-        if _ANSI_OK:
+            _erase_current_line()
             sys.stdout.write(f"\x1b[1A")   # cursor up again (erase pw line)
-        _erase_current_line()
+            _erase_current_line()
+        else:
+            _erase_current_line()
+
         print(_dim(f"  ({label} cleared from display)"))
         sys.stdout.flush()
 
@@ -179,7 +204,7 @@ def clipboard_copy_with_clear(
     # Launch a non-blocking display thread for the countdown
     display_thread = threading.Thread(
         target=_countdown_display,
-        args=(timeout, label),
+        args=(timeout, label, True), # quiet=True for background
         daemon=True,
     )
     display_thread.start()
@@ -195,20 +220,30 @@ def _clipboard_clear_job(pyperclip, label: str, timeout: int) -> None:
         pass  # best-effort
 
 
-def _countdown_display(timeout: int, label: str) -> None:
+def _countdown_display(timeout: int, label: str, quiet: bool = False) -> None:
     """
     Display a inline countdown on a single terminal line, then print a
     'cleared' confirmation.  Runs in a daemon thread.
+
+    If quiet=True, skip the live countdown to avoid interlacing with
+    other CLI output or clobbering prompts.
     """
     try:
-        for remaining in range(timeout, 0, -1):
-            msg = _dim(f"  (clipboard clears in {remaining}s)")
-            sys.stdout.write(f"{_CR}{msg}")
-            sys.stdout.flush()
-            time.sleep(1)
+        if not quiet:
+            for remaining in range(timeout, 0, -1):
+                msg = _dim(f"  (clipboard clears in {remaining}s)")
+                sys.stdout.write(f"{_CR}{msg}")
+                sys.stdout.flush()
+                time.sleep(1)
+        else:
+            # Just wait for the timeout without printing anything intermediate
+            time.sleep(timeout)
     except Exception:
         pass
     finally:
+        if quiet:
+            # Move to a new line before printing so we don't clobber the prompt
+            sys.stdout.write("\n")
         _erase_current_line()
         print(_dim(f"  ({label} cleared from clipboard)"))
         sys.stdout.flush()

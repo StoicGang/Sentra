@@ -58,7 +58,15 @@ class Colors:
         if mode == ColorMode.ALWAYS:
             return True
         # AUTO: detect terminal capability
-        return sys.stdout.isatty() and os.getenv("TERM") != "dumb"
+        # Support Windows Terminal, VSCode, and other modern terminal emulators
+        is_atty = sys.stdout.isatty()
+        if os.name == 'nt':
+            # Modern Windows Terminal or VSCode
+            if os.getenv('WT_SESSION') or os.getenv('TERM_PROGRAM') == 'vscode':
+                return True
+            # Simple check for TTY
+            return is_atty
+        return is_atty and os.getenv("TERM") != "dumb"
 
     def _wrap(self, text: str, code: str) -> str:
         if not self._enabled:
@@ -184,7 +192,7 @@ def choose_from_list(
 
 def _default_display(item: Dict) -> str:
     """Default display format for list items"""
-    title = item.get('title', 'Untitled')
+    title = item.get('title') or 'Untitled'
     username = item.get('username', '')
     user_part = f" ({username})" if username else ""
 
@@ -264,29 +272,176 @@ class SentraCLI:
         colors = Colors(color_mode)
 
         try:
-            self.vault = VaultController()
+            # Multi-vault: Central manager for the vault registry
+            self.manager_path = os.getenv("SENTRA_MANAGER_PATH", "data/manager.db")
+            self.system_vault = VaultController(db_path=self.manager_path)
+            self.active_vault: Optional[VaultController] = None
         except Exception as e:
-            print_error(f"Failed to initialize vault: {e}")
+            print_error(f"Failed to initialize manager: {e}")
             sys.exit(1)
 
         self.passgen = PasswordGenerator()
         self.totp = TOTPGenerator()
-        self.session_active = False
+        self.session_active = False  # Refers to the ACTIVE vault session
+        self.system_session_active = False # Refers to the SYSTEM manager session
+
+        # Enable native ANSI on Windows
+        from src.secure_display import init_windows_ansi
+        init_windows_ansi()
+
+        # State for enhanced copy UX
+        self._last_password_secret: Optional[str] = None
+        self._last_password_title: Optional[str] = None
+
+    def _print_global_window(self):
+        """Display a persistent status header for the session"""
+        print(colors.info("\n" + "═"*64))
+        print(colors.info(f"  SENTRA SESSION STATUS | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"))
+        print(colors.info("═"*64))
+        
+        is_unlocked = self.session_active and self.active_vault and self.active_vault.is_unlocked
+        status_icon = colors.success("🔓") if is_unlocked else colors.error("🔒")
+        sys_status = colors.success("Unlocked") if self.system_session_active else colors.error("Locked")
+        
+        vault_name = "None"
+        vault_path = "N/A"
+        if self.active_vault:
+            v_list = self.system_vault.get_registered_vaults() if self.system_session_active else []
+            match = next((v for v in v_list if os.path.abspath(v['path']) == os.path.abspath(self.active_vault.db.db_path)), None)
+            vault_name = match['nickname'] if match else "???"
+            vault_path = self.active_vault.db.db_path
+
+        print(f"  {colors.dim('System Manager:')} {sys_status}")
+        print(f"  {colors.dim('Active Vault:  ')} {colors.warning(vault_name)} {status_icon}")
+        print(f"  {colors.dim('Vault Path:    ')} {colors.dim(vault_path)}")
+        
+        if self.active_vault:
+            print(f"\n  {colors.info('💡 Tip: Type')} {colors.warning('back')} {colors.info('to return to the system manager.')}")
+            
+        print(colors.info("═"*64 + "\n"))
+
+    def _startup_vault_selection(self) -> bool:
+        """Prompt user to select a vault if none is active"""
+        if self.active_vault:
+            return True
+
+        vaults = self.system_vault.get_registered_vaults()
+        if not vaults:
+            # Check for any .db files in data directory that aren't registered
+            db_dir = os.path.dirname(self.manager_path) or "data"
+            available_files = [f for f in os.listdir(db_dir) if f.endswith(".db") and f != os.path.basename(self.manager_path)]
+            
+            if not available_files:
+                print_info("No vaults found. Create your first vault with 'vaults create'.")
+                return False
+            
+            print_warning("Found unregistered vault files. Use 'vaults add' to manage them.")
+            return False
+
+        if len(vaults) == 1:
+            print_info(f"Auto-selecting vault: {vaults[0]['nickname']}")
+            return self._switch_to_vault(vaults[0]['nickname'])
+
+        print(f"\n{colors.info('--- SELECT STARTUP VAULT ---')}")
+        for i, v in enumerate(vaults, 1):
+            print(f"  {colors.dim(str(i)+')')} {colors.info(v['nickname']):<15} {colors.dim(v['path'])}")
+        
+        while True:
+            sel = input(f"\nSelect vault (1-{len(vaults)}) or 'q' to quit: ").strip().lower()
+            if sel in ('q', 'quit', 'exit'):
+                return False
+            try:
+                idx = int(sel)
+                if 1 <= idx <= len(vaults):
+                    return self._switch_to_vault(vaults[idx-1]['nickname'])
+                print_error(f"Please enter a number between 1 and {len(vaults)}")
+            except ValueError:
+                print_error("Invalid input.")
+
+    @property
+    def vault(self) -> VaultController:
+        """Compatibility property: returns active vault or falls back to system"""
+        return self.active_vault if self.active_vault else self.system_vault
 
     # ======== Authentication ========
 
     def ensure_unlocked(self) -> bool:
         """
-        Ensures vault is unlocked with improved first-run detection.
+        Ensures both system registry and active vault are unlocked.
         """
+        if not self.ensure_system_unlocked():
+            return False
+
+        # Use self.vault property which handles fallback to system_vault
         if self.session_active and self.vault.is_unlocked:
             return True
 
-        # Check if this is first run via Controller API
-        if not self.vault.vault_exists():
-            return self._first_time_setup()
-        else:
-            return self._unlock_existing_vault()
+        if not self.active_vault:
+            # If no active vault, trigger startup selection
+            return self._startup_vault_selection()
+
+        return self._unlock_existing_vault()
+
+    def ensure_system_unlocked(self) -> bool:
+        """Gatekeeper for the entire application"""
+        if self.system_vault.is_unlocked:
+            self.system_session_active = True
+            return True
+
+        if not self.system_vault.vault_exists():
+            print_warning("\n[GATEKEEPER] System registry not found. Starting setup...")
+            success = self._first_time_system_setup()
+            if success:
+                self.system_session_active = True
+            return success
+        
+        # Unlock system
+        print(f"\n{colors.info('--- SENTRA GATEKEEPER ---')}")
+        for attempt in range(MAX_LOGIN_ATTEMPTS):
+            try:
+                pw = getpass.getpass("Overall Master Password: ")
+                if not pw: continue
+                
+                self.system_vault.unlock_vault(pw)
+                self.system_session_active = True
+                print_success("✓ System unlocked.")
+                return True
+            except AccountLockedError as e:
+                print_error(str(e))
+                return False
+            except Exception:
+                print_error(f"Invalid Overall Master Password. ({attempt + 1}/{MAX_LOGIN_ATTEMPTS})")
+        
+        return False
+
+    def _first_time_system_setup(self) -> bool:
+        """Handle first-time creation of the Global Manager"""
+        print("\n" + "="*50)
+        print(colors.info("🔐 SENTRA GLOBAL SETUP"))
+        print("="*50)
+        print("\nChoose an Overall Master Password to protect your collection of vaults.")
+        print(f"Requirements: At least {MIN_PASSWORD_LENGTH} characters")
+        print("="*50 + "\n")
+
+        for attempt in range(MAX_LOGIN_ATTEMPTS):
+            pw1 = getpass.getpass("New Overall Master Password: ")
+            if len(pw1) < MIN_PASSWORD_LENGTH:
+                print_error("Too short.")
+                continue
+            
+            pw2 = getpass.getpass("Confirm: ")
+            if pw1 != pw2:
+                print_error("Mismatch.")
+                continue
+
+            try:
+                self.system_vault.unlock_vault(pw1, create_if_missing=True)
+                print_success("✓ Global setup complete!")
+                return True
+            except Exception as e:
+                print_error(f"Global setup failed: {e}")
+                return False
+        return False
 
     def _first_time_setup(self) -> bool:
         """Handle first-time vault creation with proper UX"""
@@ -570,36 +725,43 @@ class SentraCLI:
                 else:
                     print(f"Generated Password: {colors.warning(password)}")
             elif not args.batch:
-                choice = input("\nPassword: [E]nter / [G]enerate / [B]lank? ").strip().lower()
+                while True:
+                    choice = input("\nPassword: [E]nter / [G]enerate / [B]lank? ").strip().lower()
 
-                if choice == 'g':
-                    length = args.length or DEFAULT_PASSWORD_LENGTH
-                    password, _ = self.passgen.generate_password(length=length)
+                    if choice == 'g':
+                        length = args.length or DEFAULT_PASSWORD_LENGTH
+                        password, _ = self.passgen.generate_password(length=length)
 
-                    if not args.show:
-                        print_success(f"Generated secure password ({length} chars)")
+                        if not args.show:
+                            print_success(f"Generated secure password ({length} chars)")
+                        else:
+                            print(f"Generated: {colors.warning(password)}")
+                        break
+
+                    elif choice == 'e':
+                        password = getpass.getpass("Password: ")
+                        if password:
+                            context = []
+                            if title: context.append(title)
+                            if username: context.append(username)
+
+                            try:
+                                score, label, _ = self.passgen.calculate_strength(password, user_inputs=context)
+                            except Exception:
+                                # Log generic error, do not print exception 'e' which might contain the password
+                                print_warning("Could not calculate password strength.")
+                                score = 50  # Assume medium to proceed safely
+
+                            if score < 30:
+                                if not confirm_action("Very weak password. Use anyway?", dangerous=True):
+                                    password = None
+                                    continue
+                        break
+                    elif choice == 'b':
+                        password = None
+                        break
                     else:
-                        print(f"Generated: {colors.warning(password)}")
-
-                elif choice == 'e':
-                    password = getpass.getpass("Password: ")
-                    if password:
-                        context = []
-                        if title: context.append(title)
-                        if username: context.append(username)
-
-                        try:
-                            score, label, _ = self.passgen.calculate_strength(password, user_inputs=context)
-                        except Exception:
-                            # Log generic error, do not print exception 'e' which might contain the password
-                            print_warning("Could not calculate password strength.")
-                            score = 50  # Assume medium to proceed safely
-
-                        if score < 30:
-                            if not confirm_action("Very weak password. Use anyway?", dangerous=True):
-                                return
-                else:
-                    password = None
+                        print_error("Invalid choice. Please enter 'e', 'g', or 'b'.")
 
         # Notes (optional)
         notes = args.notes
@@ -660,7 +822,7 @@ class SentraCLI:
                 # Note: For true sorted pagination, DB indexes must match sort order.
                 # Default DB sort is modified_at DESC.
                 if args.sort == 'title':
-                    entries.sort(key=lambda x: x.get('title', '').lower())
+                    entries.sort(key=lambda x: (x.get('title') or '').lower())
 
                 # Display
                 header = "Trash" if args.trash else "Vault Entries"
@@ -733,19 +895,20 @@ class SentraCLI:
             # Password handling
             pw = entry.get('password')
             if pw:
-                if args.show:
-                    # Timed reveal: password shown then erased from terminal
-                    print("=" * 60)
-                    timed_reveal(pw, label="Password", duration=REVEAL_DURATION_SECS)
-                    print("=" * 60)
-                else:
+                if not args.show:
                     masked = "●" * 12
-                    print(f"  {colors.dim('Password:')} {masked} "
-                          f"{colors.dim('(use --show to reveal, --copy to copy)')}")
+                    # Visual "Copy Button" hint
+                    copy_hint = f" [{colors.info('📋 Copy (c)')}]"
+                    print(f"  {colors.dim('Password:')} {masked} {copy_hint}")
+                else:
+                    # In --show mode, we only show labels here, actual reveal is at the end
+                    print(f"  {colors.dim('Password:')} [Revealing at bottom...]")
 
-                # Copy to clipboard
-                if getattr(args, 'copy', False):
-                    clipboard_copy_with_clear(pw, timeout=CLIPBOARD_CLEAR_SECS, label="Password")
+                # Store for "one-click" copy command
+
+                # Store for "one-click" copy command
+                self._last_password_secret = pw
+                self._last_password_title = entry.get('title')
 
                 # Show strength
                 strength = entry.get('password_strength', 0)
@@ -757,6 +920,10 @@ class SentraCLI:
                     label = colors.success("Strong")
                 print(f"  {colors.info('Strength:')} {label} ({strength}/100)")
 
+                # Copy to clipboard (legacy flag support)
+                if getattr(args, 'copy', False):
+                    self.cmd_copy(None)
+
             if entry.get('tags'):
                 print(f"  {colors.info('Tags:')}     {entry.get('tags')}")
 
@@ -766,6 +933,15 @@ class SentraCLI:
                 print(f"  {colors.info('Notes:')}")
                 for line in entry.get('notes', '').split('\n'):
                     print(f"    {line}")
+
+            # NEW: Move password reveal to the absolute end for reliability
+            if pw and args.show:
+                from src.secure_display import timed_reveal
+                print("-" * 60)
+                timed_reveal(pw, label="Password", duration=REVEAL_DURATION_SECS)
+                # Visual "Copy Button" hint even when revealed
+                copy_hint = f" [{colors.info('📋 Copy (c)')}]"
+                print(f"{copy_hint}")
 
             print("=" * 60 + "\n")
 
@@ -919,7 +1095,7 @@ class SentraCLI:
         except Exception as e:
             print_error(f"Failed to delete entry: {e}")
 
-    def cmd_recover(self, _=None):
+    def cmd_restore(self, _=None):
         """Recover (undelete) an entry from trash."""
         if not self.ensure_unlocked():
             return
@@ -1202,24 +1378,45 @@ class SentraCLI:
         if not self.ensure_unlocked():
             return
 
-        confirm1 = input("Type 'DESTROY' to confirm intent: ")
+        confirm1 = input("Type 'DESTROY' to confirm intent: ").strip()
         if confirm1.upper() != "DESTROY":
             print_info("Action cancelled.")
             return
 
         print(colors.warning("\nFinal Warning: Database will be erased IMMEDIATELY."))
-        confirm2 = input("Type 'YES DELETE EVERYTHING' to finish: ")
-        if confirm2 != "YES DELETE EVERYTHING":
+        confirm2 = input("Type 'YES DELETE EVERYTHING' to finish: ").strip()
+        if confirm2.upper() != "YES DELETE EVERYTHING":
             print_info("Action cancelled.")
             return
 
         try:
+            # Determine nickname for unregistration
+            v_list = self.system_vault.get_registered_vaults() if self.system_session_active else []
+            current_path = os.path.abspath(self.active_vault.db.db_path)
+            nickname = next((v['nickname'] for v in v_list if os.path.abspath(v['path']) == current_path), None)
+
             self.vault.self_destruct()
+            
+            # --- Sync with Manager ---
+            if nickname and self.system_session_active:
+                try:
+                    self.system_vault.unregister_vault(nickname)
+                except Exception:
+                    pass
+
+            # Reset CLI state
+            self.active_vault = None
+            self.session_active = False
+            
         except VaultDestroyedError as e:
+            # Reset CLI state even on "error" (which is the success signal for destruction)
+            self.active_vault = None
+            self.session_active = False
             print("\n" + "!" * 60)
             print(colors.error(f"  {e}"))
             print("!" * 60 + "\n")
-            sys.exit(0)
+            # Do NOT exit, return to GATE/manager context
+            return 
         except Exception as e:
             print_error(f"Failed to self-destruct: {e}")
 
@@ -1286,17 +1483,29 @@ class SentraCLI:
             print_error(f"Security check failed: {e}")
 
     def cmd_lock(self, _=None):
-        """Lock vault securely"""
-        if not self.session_active:
-            print_info("Vault is already locked.")
-            return
+        """Lock active vault and manager securely"""
+        unlocked_anything = False
 
-        try:
-            self.vault.lock_vault()
-            self.session_active = False
-            print_success("✓ Vault locked securely.")
-        except Exception as e:
-            print_error(f"Failed to lock vault: {e}")
+        if self.active_vault and self.active_vault.is_unlocked:
+            try:
+                self.active_vault.lock_vault()
+                self.session_active = False
+                unlocked_anything = True
+                print_success("✓ Active vault locked.")
+            except Exception as e:
+                print_error(f"Failed to lock active vault: {e}")
+        
+        if self.system_vault.is_unlocked:
+            try:
+                self.system_vault.lock_vault()
+                self.system_session_active = False
+                unlocked_anything = True
+                print_success("✓ System manager locked.")
+            except Exception as e:
+                print_error(f"Failed to lock manager: {e}")
+
+        if not unlocked_anything:
+            print_info("Everything is already locked.")
 
     def cmd_export(self, args):
         """Export to CSV (DANGEROUS - plaintext)"""
@@ -1364,12 +1573,18 @@ class SentraCLI:
 
     # ======== Recovery Commands ========
 
-    def cmd_recover(self, args):
+    def cmd_forget_masterpass(self, args):
         """
         Recover vault access when master password is forgotten.
         Does NOT require being unlocked. Prompts for recovery credential,
         then sets a new master password.
         """
+        print("\n" + "═"*60)
+        print(colors.warning(" 🔐 FORGOTTEN MASTER PASSWORD RECOVERY"))
+        print("═"*60)
+        print("\nThis process will use your pre-configured recovery")
+        print("credentials (passphrase or codes) to reset your vault access.")
+        print(colors.info("No existing entries will be lost."), "\n")
         if self.vault.is_unlocked:
             print_error("Vault is already unlocked. Use this command only when locked out.")
             return
@@ -1526,6 +1741,49 @@ class SentraCLI:
                     ))
         print()
 
+    def cmd_copy(self, _=None):
+        """Stateful copy command for the last viewed entry"""
+        if not self.ensure_unlocked():
+            return
+            
+        if not self._last_password_secret:
+            print_error("No entry has been viewed yet. Run 'get' first.")
+            return
+
+        from src.secure_display import clipboard_copy_with_clear, CLIPBOARD_CLEAR_SECS
+        
+        # Get timeout from config
+        timeout_raw = self.vault.get_config("clipboard_timeout")
+        timeout = int(timeout_raw) if timeout_raw else CLIPBOARD_CLEAR_SECS
+        
+        clipboard_copy_with_clear(
+            self._last_password_secret, 
+            timeout=timeout, 
+            label=f"Password for '{self._last_password_title}'"
+        )
+
+    def cmd_config(self, args):
+        """Manage application configuration"""
+        if not self.ensure_unlocked():
+            return
+
+        if args.clipboard_timeout is not None:
+            if args.clipboard_timeout < 0:
+                print_error("Timeout cannot be negative.")
+                return
+            self.vault.set_config("clipboard_timeout", args.clipboard_timeout)
+            print_success(f"✓ Clipboard auto-clear timeout set to {args.clipboard_timeout}s.")
+            return
+
+        from src.secure_display import CLIPBOARD_CLEAR_SECS
+        # Show current config
+        timeout_raw = self.vault.get_config("clipboard_timeout")
+        timeout = int(timeout_raw) if timeout_raw else CLIPBOARD_CLEAR_SECS
+        
+        print(f"\n{colors.info('--- Sentra Configuration ---')}")
+        print(f"Clipboard Timeout: {timeout}s")
+        print()
+
 
     def cmd_status(self, args):
         """
@@ -1588,6 +1846,172 @@ class SentraCLI:
                 print(colors.success("  Lockout:  No lockout active"))
         print()
 
+    # ======== Multi-Vault Commands ========
+
+    def cmd_vaults(self, args):
+        """Manage multiple vaults"""
+        # Ensure system is unlocked before any vault management
+        if not self.ensure_system_unlocked():
+            return
+
+        subcmd = getattr(args, "subcmd", None) or "list"
+
+        if subcmd == "list":
+            self.cmd_vaults_list()
+        elif subcmd == "create":
+            nickname = getattr(args, "name", None) or input("Vault name (nickname): ").strip()
+            if not nickname: return
+            self.cmd_vaults_create(nickname)
+        elif subcmd == "add":
+            path = getattr(args, "path", None) or input("Path to vault file: ").strip()
+            name = getattr(args, "name", None) or input("Nickname for this vault: ").strip()
+            if not path or not name: return
+            try:
+                self.system_vault.register_vault(name, path)
+                print_success(f"✓ Registered '{name}' at {path}")
+            except Exception as e:
+                print_error(f"Failed to register: {e}")
+        elif subcmd == "remove":
+            nickname = getattr(args, "name", None) or input("Nickname to remove: ").strip()
+            if not nickname: return
+            
+            # Find path for deletion if requested
+            vaults = self.system_vault.get_registered_vaults()
+            target = next((v for v in vaults if v['nickname'] == nickname), None)
+            
+            confirm_msg = f"Remove '{nickname}' from manager? (Does NOT delete file)"
+            should_delete_file = getattr(args, 'delete', False)
+            if should_delete_file:
+                confirm_msg = f"PERMANENTLY DELETE '{nickname}' and its database file? This cannot be undone."
+                
+            if confirm_action(confirm_msg, dangerous=True):
+                self.system_vault.unregister_vault(nickname)
+                print_success(f"✓ Removed '{nickname}' from registry.")
+                
+                if should_delete_file and target:
+                    try:
+                        path = target['path']
+                        if os.path.exists(path):
+                            os.remove(path)
+                            print_success(f"✓ Deleted file at {path}")
+                        else:
+                            print_warning(f"File already missing at {path}")
+                    except Exception as e:
+                        print_error(f"Failed to delete file: {e}")
+        elif subcmd == "switch":
+            nickname = getattr(args, "name", None) or input("Switch to vault: ").strip()
+            if not nickname: return
+            if self._switch_to_vault(nickname):
+                self._print_global_window()
+
+    def cmd_vaults_list(self):
+        vaults = self.system_vault.get_registered_vaults()
+        registered_paths = {os.path.abspath(v['path']) for v in vaults}
+        
+        print(f"\n{colors.info('--- Managed Vaults ---')}")
+        if not vaults:
+            print("  (No vaults registered)")
+        else:
+            for v in vaults:
+                path_exists = os.path.exists(v['path'])
+                status = "" if path_exists else colors.error(" [MISSING]")
+                
+                # Highlight active vault
+                is_active = False
+                if self.active_vault:
+                    current_path = os.path.abspath(self.active_vault.db.db_path)
+                    target_path = os.path.abspath(v['path'])
+                    is_active = (current_path == target_path)
+                
+                active_marker = colors.success("➤") if is_active else " "
+                nickname_display = colors.info(v['nickname'])
+                if is_active:
+                    nickname_display = colors.success(v['nickname'])
+                
+                print(f"  {active_marker} {nickname_display:<18} {colors.dim(v['path'])}{status}")
+        
+        # Orphan detection
+        db_dir = os.path.dirname(self.manager_path) or "data"
+        if os.path.exists(db_dir):
+            orphans = []
+            for f in os.listdir(db_dir):
+                if f.endswith(".db") and f != os.path.basename(self.manager_path):
+                    full_path = os.path.abspath(os.path.join(db_dir, f))
+                    if full_path not in registered_paths:
+                        orphans.append(full_path)
+            
+            if orphans:
+                print(f"\n{colors.warning('--- Unregistered Vaults (Found on Disk) ---')}")
+                print(colors.dim("  These files are in your data folder but not in the Sentra registry."))
+                print(colors.dim("  Use 'vaults add <path> <name>' to manage them.\n"))
+                for o_path in orphans:
+                    print(f"  ? {colors.dim(o_path)}")
+        print()
+
+    def cmd_vaults_create(self, nickname: str):
+        path = os.path.join("data", f"{nickname}.db")
+        if os.path.exists(path):
+            print_error(f"File already exists: {path}")
+            return
+            
+        print_info(f"Creating new vault database: {path}")
+        temp_vc = VaultController(db_path=path)
+        old_active = self.active_vault
+        self.active_vault = temp_vc
+        
+        if self._first_time_setup():
+            # SUCCESS
+            self.system_vault.register_vault(nickname, path)
+            print_success(f"✓ Vault '{nickname}' created and registered.")
+        else:
+            # Revert
+            temp_vc.close() # RELEASE HANDLE for cleanup
+            self.active_vault = old_active
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    print_error(f"Cleanup failed (file locked): {e}")
+
+    def _switch_to_vault(self, nickname: str) -> bool:
+        vaults = self.system_vault.get_registered_vaults()
+        
+        # 1. Try exact nickname match
+        target = next((v for v in vaults if v['nickname'] == nickname), None)
+        
+        # 2. Try case-insensitive nickname match
+        if not target:
+            target = next((v for v in vaults if v['nickname'].lower() == nickname.lower()), None)
+            
+        # 3. Try match without .db extension (if user provided it)
+        if not target and nickname.lower().endswith(".db"):
+            base = nickname[:-3]
+            target = next((v for v in vaults if v['nickname'] == base or v['nickname'].lower() == base.lower()), None)
+            
+        # 4. Try match with .db extension (if user omitted it)
+        if not target and not nickname.lower().endswith(".db"):
+            ext = nickname + ".db"
+            target = next((v for v in vaults if v['nickname'] == ext or v['nickname'].lower() == ext.lower()), None)
+
+        if not target:
+            print_error(f"Vault '{nickname}' not found in registry.")
+            if vaults:
+                print_info("Registered vaults: " + ", ".join(f"'{v['nickname']}'" for v in vaults))
+            return False
+        
+        path = target['path']
+        if not os.path.exists(path):
+            print_error(f"Vault file missing at: {path}")
+            return False
+            
+        if self.active_vault:
+            self.active_vault.close() # RELEASE HANDLE before switching
+            
+        self.active_vault = VaultController(db_path=path)
+        self.session_active = False
+        print_info(f"Switched to vault: {target['nickname']}")
+        return self._unlock_existing_vault()
+
     @staticmethod
     def build_parser() -> argparse.ArgumentParser:
         """Build argument parser with all commands"""
@@ -1604,6 +2028,13 @@ class SentraCLI:
                           version='Sentra 1.0.0')
 
         subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+        # ---- Multi-Vault Management ----
+        vaults = subparsers.add_parser('vaults', help='Manage multiple vaults')
+        vaults.add_argument('subcmd', nargs='?', choices=['list', 'create', 'add', 'remove', 'switch'], default='list')
+        vaults.add_argument('name', nargs='?', help='Vault nickname')
+        vaults.add_argument('--path', help='File path for "add"')
+        vaults.add_argument('--delete', action='store_true', help='Permanently delete file on "remove"')
 
         # ---- Authentication ----
         subparsers.add_parser('login', help='Unlock vault')
@@ -1656,7 +2087,7 @@ class SentraCLI:
         delete.add_argument('--title', '-t', help='Search entry by title')
         delete.add_argument('--permanent', action='store_true', help='Permanently delete (bypass trash)')
 
-        subparsers.add_parser('recover', help='Recover deleted entry from trash')
+        subparsers.add_parser('restore', help='Recover deleted entry from trash')
 
         # ---- Tools ----
         genpass = subparsers.add_parser('genpass', help='Generate secure password')
@@ -1676,7 +2107,7 @@ class SentraCLI:
 
         # ---- Account Recovery ----
         subparsers.add_parser(
-            'recover',
+            'forget-masterpass',
             help='Recover vault access when master password is forgotten (no unlock required)',
         )
 
@@ -1714,6 +2145,15 @@ class SentraCLI:
         sd.add_argument('--disable', action='store_true', help='Disable auto-destruction')
         sd.add_argument('--status', action='store_true', help='Show self-destruct configuration')
 
+        subparsers.add_parser('copy', help='Copy password of last viewed entry')
+        
+        config = subparsers.add_parser('config', help='Manage application configuration')
+        config.add_argument('--clipboard-timeout', type=int, help='Set clipboard auto-clear duration (seconds)')
+
+        # ---- Quick Switch Shortcut ----
+        switch = subparsers.add_parser('switch', help='Quickly switch between vaults')
+        switch.add_argument('name', nargs='?', help='Vault nickname')
+
         return parser
 
     def dispatch(self, args):
@@ -1730,14 +2170,20 @@ class SentraCLI:
             'delete': self.cmd_delete,
             'genpass': self.cmd_genpass,
             'totp': self.cmd_totp,
-            'recover': self.cmd_recover,
+            'restore': self.cmd_restore,
+            'forget-masterpass': self.cmd_forget_masterpass,
             'recovery': self.cmd_recovery,
             'backup': self.cmd_backup,
             'import': self.cmd_import,
             'audit': self.cmd_audit,
             'security': self.cmd_security,
             'export': self.cmd_export,
-            'self-destruct': self.cmd_self_destruct
+            'self-destruct': self.cmd_self_destruct,
+            'copy': self.cmd_copy,
+            'c': self.cmd_copy,  # Shortcut
+            'config': self.cmd_config,
+            'vaults': self.cmd_vaults,
+            'switch': lambda a: self.cmd_vaults(argparse.Namespace(subcmd='switch', name=a.name))
         }
 
         if args.command in handlers:
@@ -1753,13 +2199,32 @@ class SentraCLI:
         print(colors.info("╚════════════════════════════════════╝"))
         print("\nType 'help' for commands, 'exit' to quit\n")
 
+        # Initial Global Status Window
+        if self.ensure_system_unlocked():
+            self._print_global_window()
+
         parser = self.build_parser()
 
         while True:
             try:
                 # Status indicator
-                status = colors.success("🔓") if self.session_active else colors.error("🔒")
-                prompt = f"{status} sentra> "
+                status_icon = colors.success("🔓") if (self.session_active and self.vault.is_unlocked) else colors.error("🔒")
+                
+                # Context indicator
+                if not self.system_session_active:
+                    prompt_ctx = colors.error("GATEKEEPER")
+                else:
+                    sys_part = colors.info("manager")
+                    if self.active_vault:
+                        # Find nickname
+                        v_list = self.system_vault.get_registered_vaults()
+                        match = next((v for v in v_list if os.path.abspath(v['path']) == os.path.abspath(self.active_vault.db.db_path)), None)
+                        v_name = match['nickname'] if match else "???"
+                        prompt_ctx = f"{sys_part} {colors.dim('@')} {colors.warning(v_name)}"
+                    else:
+                        prompt_ctx = sys_part
+                
+                prompt = f"{status_icon} {colors.dim('[')}{prompt_ctx}{colors.dim(']')} sentra> "
 
                 text = input(prompt).strip()
 
@@ -1774,6 +2239,23 @@ class SentraCLI:
 
                 if text == 'help':
                     parser.print_help()
+                    continue
+
+                if text in ('back', 'exit-vault', 'return'):
+                    if self.active_vault:
+                        nickname = "Active vault"
+                        # Try to find name for pretty printing
+                        v_list = self.system_vault.get_registered_vaults() if self.system_session_active else []
+                        current_path = os.path.abspath(self.active_vault.db.db_path)
+                        match = next((v for v in v_list if os.path.abspath(v['path']) == current_path), None)
+                        if match: nickname = f"vault '{match['nickname']}'"
+                        
+                        self.active_vault.lock_vault()
+                        self.active_vault = None
+                        self.session_active = False
+                        print_success(f"✓ Locked {nickname} and returned to manager.")
+                    else:
+                        print_info("Already at system manager level. Use 'exit' to quit Sentra.")
                     continue
 
                 if text == 'clear':

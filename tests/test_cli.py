@@ -24,6 +24,11 @@ def mock_vault():
         instance.view_audit_log.return_value = []
         instance.update_entry.return_value = True # Ensure updates succeed
         
+        # Multi-vault support: return one mock vault in registry by default
+        instance.get_registered_vaults.return_value = [
+            {'nickname': 'personal', 'path': 'data/personal.db'}
+        ]
+        
         yield instance
 
 @pytest.fixture
@@ -47,7 +52,10 @@ def cli(mock_vault, mock_passgen, mock_totp):
     """Returns a CLI instance with mocked dependencies"""
     with patch('builtins.print'):  # Suppress init prints
         # Use simple color mode for tests
-        app = SentraCLI(color_mode=None) 
+        app = SentraCLI(color_mode='never') 
+        # By default, assume manager is unlocked to avoid GATEKEEPER prompts in most tests
+        app.system_session_active = True
+        app.system_vault.is_unlocked = True
         return app
 
 # -----------------------------------------------------------------------------
@@ -57,17 +65,26 @@ def cli(mock_vault, mock_passgen, mock_totp):
 class TestAuthentication:
     
     def test_ensure_unlocked_already_active(self, cli):
+        # Setup an active vault
+        cli.active_vault = MagicMock()
+        cli.active_vault.is_unlocked = True
         cli.session_active = True
-        cli.vault.is_unlocked = True
         assert cli.ensure_unlocked() is True
 
     @patch('getpass.getpass')
     def test_unlock_existing_success(self, mock_getpass, cli):
-        cli.vault.vault_exists.return_value = True
+        # Manager is already unlocked by fixture
+        cli.active_vault = None
+        cli.session_active = False
+        
+        # When ensure_unlocked is called, it should auto-select the 'personal' vault
+        # and prompt for its password.
         mock_getpass.return_value = "valid_long_password"
+        # mock_vault already has 'personal' registered and exists.
         
         assert cli.ensure_unlocked() is True
-        cli.vault.unlock_vault.assert_called_with("valid_long_password")
+        assert cli.active_vault is not None
+        cli.active_vault.unlock_vault.assert_called_with("valid_long_password")
         assert cli.session_active is True
 
     @patch('getpass.getpass')

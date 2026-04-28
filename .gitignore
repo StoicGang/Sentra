@@ -9,6 +9,7 @@ env/
 *.egg-info/
 dist/
 build/
+temp/
 
 # IDE
 .vscode/
@@ -17,15 +18,40 @@ build/
 *.swo
 
 # Sentra specific
-data/vault.db
+docs/
+data/manager.db
 data/backups/
 *.enc
 *.csv
 *.yaml
 *.db
-sentra_config.json
+*.db-shm
+*.db-wal
+*sentra_config.json
 
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
+*.txt
+
+# Frontend
+web/frontend/node_modules/
+web/frontend/dist/
+web/frontend/playwright-report/
+web/frontend/test-results/
+web/frontend/static/ 
+
+# Redundant / Research
+"Research & Study/"
+docs/*.html
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Environment secrets
+.env
+.env.*
+!.env.example

@@ -1,31 +1,42 @@
-# Sentra — CLI Password Manager
+# Sentra — CLI & Web Password Manager
 
-Sentra is a small, secure command-line password manager implemented in Python. It provides a local encrypted vault, password generation and strength feedback, TOTP support, backup/import, and basic auditing tools — designed for privacy-first workflows and automation.
+Sentra is a secure, local-first password manager. It provides a robust command-line interface and a modern web dashboard for managing your encrypted vault. It features strong crypto primitives, password generation, TOTP support, and secure session management.
 
 **Key features**
 - **Encrypted vault** using strong crypto primitives (see [src/crypto_engine.py](src/crypto_engine.py)).
+- **Web Dashboard** with a modern React interface ([web/frontend/](web/frontend/)).
 - **Password generation** with strength scoring ([src/password_generator.py](src/password_generator.py)).
 - **TOTP** generation and management ([src/totp_generator.py](src/totp_generator.py)).
 - **Adaptive lockout** and secure in-memory handling ([src/adaptive_lockout.py](src/adaptive_lockout.py), [src/secure_memory.py](src/secure_memory.py)).
 - **Backup / import / export** utilities and basic audit tooling.
 
 **Quick Links**
+- Web Launch: [sentra_web.py](sentra_web.py)
 - CLI entry: [sentra_cli.py](sentra_cli.py)
 - Core modules: [src/crypto_engine.py](src/crypto_engine.py), [src/vault_controller.py](src/vault_controller.py)
 - Tests: [tests/](tests/)
 
-## Install
+## Installation
 
+### Python Backend & CLI
 Recommended: create a virtual environment and install with pip.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # on Windows: .venv\\Scripts\\activate
+source .venv/bin/activate   # on Windows: .venv\Scripts\activate
 pip install -U pip
-pip install -e .[dev]       # editable install; or `pip install .` to install normally
+pip install -e .[dev]       # editable install
 ```
 
-Dependencies are declared in `setup.py` (cryptography, argon2-cffi, pyotp, rich, python-dotenv). See `requirements.txt` for pinned extras.
+Dependencies include `cryptography`, `argon2-cffi`, `pyotp`, `fastapi`, and `uvicorn`.
+
+### Web Frontend (Development)
+The frontend requires Node.js (v18+) and npm.
+
+```bash
+cd web/frontend
+npm install
+```
 
 ## Usage
 
@@ -89,7 +100,3 @@ pytest -q
 ## Contributing
 
 Contributions welcome. Please open issues for bugs or feature requests and follow typical pull request workflow. Add tests for new behavior.
-
-## Acknowledgements & References
-
-- See the [Research & Study/](Research%20&%20Study/) folder for notes, references, and audit reports.

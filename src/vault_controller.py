@@ -3,6 +3,8 @@ SENTRA vault Controller
 Managers vault unlock/lock lifecycle and entry operations with hierarchical key management
 """
 
+import os
+
 from typing import Optional, List, Dict, Tuple, Any
 from datetime import datetime, timezone
 import warnings
@@ -109,6 +111,12 @@ class VaultController:
         self.unlock_timestamp: Optional[str] = None
         self._state_lock = threading.RLock()
         self._schema_initialized = False
+
+    def close(self):
+        """Release database file handles and clear secure memory."""
+        self.db.close()
+        self.secure_mem.cleanup_all()
+        self.is_unlocked = False
     
     def _check_unlocked(self) -> None:
         """
@@ -133,8 +141,7 @@ class VaultController:
         """
         try:
             # Ensure schema exists only once per controller, not on every call.
-            # initialize_database is idempotent, but redundant calls are wasteful.
-            if not hasattr(self, "_schema_initialized"):
+            if not self._schema_initialized:
                 self.db.initialize_database()
                 self._schema_initialized = True
 
@@ -151,13 +158,194 @@ class VaultController:
             warnings.warn(f"vault_exists() check failed: {e}", RuntimeWarning)
             return False
 
-    def unlock_vault(self, password: str, create_if_missing: bool = False) -> bool:
+    @staticmethod
+    def get_vault_info(db_path: str) -> Dict[str, Any]:
+        """
+        Retrieve non-sensitive metadata and statistics for a vault file.
+        Does NOT require the master password.
+        """
+        if not os.path.exists(db_path):
+            return {"exists": False, "name": os.path.basename(db_path)}
+        
+        db = DatabaseManager(db_path)
+        try:
+            meta = db.load_vault_metadata()
+            if not meta:
+                return {"exists": False, "name": os.path.basename(db_path), "initialized": False}
+            
+            # Count entries
+            conn = db.connect()
+            res = conn.execute("SELECT COUNT(*) FROM entries WHERE is_deleted = 0").fetchone()
+            item_count = res[0] if res else 0
+            
+            return {
+                "exists": True,
+                "name": os.path.basename(db_path),
+                "display_name": meta.get("display_name") or os.path.basename(db_path).replace(".db", ""),
+                "description": meta.get("description") or "",
+                "item_count": item_count,
+                "created_at": meta.get("created_at"),
+                "last_accessed_at": meta.get("last_unlocked_at"),
+                "version": meta.get("version", "2.0")
+            }
+        except Exception:
+            return {"exists": True, "name": os.path.basename(db_path), "corrupt": True}
+        finally:
+            db.close()
+
+    def delete_vault(self, password: str) -> bool:
+        """
+        Irreversibly delete this vault after verifying the password.
+        """
+        # We must be unlocked to verify the password, or we verify it manually
+        # If we are already unlocked, we just verify the password again for friction
+        metadata = self.db.load_vault_metadata()
+        if not metadata:
+            raise VaultError("Vault not initialized")
+        
+        salt = metadata["salt"]
+        ok = verify_auth_hash(metadata["auth_hash"], password, salt)
+        if not ok:
+            self.adaptive_lockout.record_failure()
+            raise VaultError("Invalid master password")
+        
+        # friction passed, annihilate
+        self.execute_self_destruct()
+        return True
+
+    def change_master_password(self, current_password: str, new_password: str) -> bool:
+        """
+        Re-encrypt the vault key under a new master password.
+        Requires re-authentication for friction.
+        """
+        with self._state_lock:
+            self._check_unlocked()
+            
+            # 1. Verify current password
+            meta = self.db.load_vault_metadata()
+            if not meta:
+                raise VaultError("Vault metadata not found")
+
+            if not verify_auth_hash(meta["auth_hash"], current_password, meta["salt"]):
+                self.adaptive_lockout.record_failure()
+                raise VaultError("Invalid current master password")
+
+            # 2. Derive existing master key from current session/password
+            # We already have self.master_key_secure, but let's be explicit and re-derive 
+            # or just use it. Re-deriving is safer for the "verification" step.
+            kdf_loaded = json.loads(meta["kdf_config"])
+            old_master_key = derive_master_key(
+                password=current_password,
+                salt=meta["salt"],
+                time_cost=kdf_loaded.get("time_cost", 3),
+                memory_cost=kdf_loaded.get("memory_cost", 65536),
+                parallelism=kdf_loaded.get("parallelism", 4)
+            )
+
+            # 3. Decrypt vault key
+            try:
+                vault_key_json = decrypt_entry(
+                    ciphertext=meta["vault_key_encrypted"],
+                    nonce=meta["vault_key_nonce"],
+                    auth_tag=meta["vault_key_tag"],
+                    key=old_master_key,
+                    associated_data=b"vault-key-v1"
+                )
+            except Exception as e:
+                raise CriticalVaultError(f"Failed to decrypt vault key during rotation: {e}")
+
+            # 4. Generate NEW parameters
+            new_salt = generate_salt(16)
+            new_auth_hash = compute_auth_hash(new_password, new_salt)
+            
+            # Use current benchmarked params if possible, or keep old ones
+            # For simplicity, we keep the old KDF params or use defaults
+            new_kdf_params = kdf_loaded 
+
+            new_master_key = derive_master_key(
+                password=new_password,
+                salt=new_salt,
+                time_cost=new_kdf_params.get("time_cost", 3),
+                memory_cost=new_kdf_params.get("memory_cost", 65536),
+                parallelism=new_kdf_params.get("parallelism", 4)
+            )
+
+            # 5. Re-encrypt vault key under new master key
+            ciphertext, nonce, tag = encrypt_entry(
+                plaintext=vault_key_json,
+                key=new_master_key,
+                associated_data=b"vault-key-v1"
+            )
+
+            # 6. Update database
+            conn = self.db.connect()
+            try:
+                conn.execute("""
+                    UPDATE vault_metadata
+                    SET salt = ?, auth_hash = ?, 
+                        vault_key_encrypted = ?, vault_key_nonce = ?, vault_key_tag = ?,
+                        kdf_config = ?, version = '2.3'
+                    WHERE id = 1
+                """, (
+                    new_salt, new_auth_hash,
+                    ciphertext, nonce, tag,
+                    json.dumps(new_kdf_params)
+                ))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                raise DatabaseError(f"Failed to update vault metadata during password rotation: {e}")
+
+            # 7. Audit Log
+            self.add_audit_log(
+                action_type="SECURITY_SENSITIVE_UPDATE",
+                severity="Critical",
+                details="Master password changed successfully. All other sessions invalidated."
+            )
+
+            # 8. Force Lock (requirements: "Invalidate all active sessions, force re-login")
+            self.lock_vault()
+            return True
+
+    def get_account_info(self) -> Dict[str, Any]:
+        """Fetch account-level metadata for Profile settings."""
+        meta = self.db.load_vault_metadata()
+        if not meta:
+            return {}
+        
+        return {
+            "username": meta.get("username", "admin"),
+            "account_status": meta.get("account_status", "Active"),
+            "created_at": meta.get("created_at"),
+            "last_login": meta.get("last_unlocked_at"),
+            "display_name": meta.get("display_name"),
+            "description": meta.get("description")
+        }
+
+    def get_preferences(self) -> Dict[str, Any]:
+        """Fetch UI preferences."""
+        meta = self.db.load_vault_metadata()
+        if not meta:
+            return {}
+        try:
+            return json.loads(meta.get("preferences", "{}"))
+        except:
+            return {}
+
+    def update_preferences(self, preferences: Dict[str, Any]) -> bool:
+        """Update and persist UI preferences."""
+        return self.db.update_metadata_field("preferences", json.dumps(preferences))
+
+    def get_session_history(self, limit: int = 10) -> List[Dict]:
+        """Fetch historical session events."""
+        return self.db.get_session_history(limit)
+
+    def unlock_vault(self, password: str, create_if_missing: bool = False, display_name: str = None, description: str = None) -> bool:
         with self._state_lock:
             if self.is_unlocked:
                 raise VaultAlreadyUnlockedError("Vault is already unlocked. Call lock_vault() first.")
             try:
-                # Use the hasattr check as seen in your file, or self._schema_initialized if you defined it
-                if not hasattr(self, "_schema_initialized"):
+                if not self._schema_initialized:
                     self.db.initialize_database()
                     self._schema_initialized = True
             except Exception as e:
@@ -236,7 +424,9 @@ class VaultController:
                     vault_key_encrypted=ciphertext,
                     vault_key_nonce=nonce,
                     vault_key_tag=tag,
-                    kdf_config=kdf_params
+                    kdf_config=kdf_params,
+                    display_name=display_name,
+                    description=description
                 )
 
                 if not saved:
@@ -316,14 +506,20 @@ class VaultController:
                 if not ok:
                     # record failure and surface a clear error
                     self.adaptive_lockout.record_failure()
+                    self.db.add_audit_log(action_type="failed_unlock", details="Invalid master password attempt")
 
                     # NEW: Auto self-destruct trigger
+                    enabled = self.get_config("auto_self_destruct_enabled")
                     threshold = self.get_config("auto_self_destruct_threshold")
-                    if threshold is not None:
-                        # check failures
+                    
+                    # Robust check for JSON-parsed booleans or raw strings
+                    is_enabled = enabled is True or str(enabled).lower() == "true"
+                    
+                    if is_enabled and threshold is not None:
                         status = self.adaptive_lockout.get_status()
                         if status["failures"] >= int(threshold):
-                            self.self_destruct()
+                            # Atomic annihilation
+                            self.execute_self_destruct()
 
                     raise VaultError("Invalid password")
 
@@ -418,6 +614,7 @@ class VaultController:
                 self.vault_key_secure = vault_buf
 
                 self.is_unlocked = True
+                self.db.add_audit_log(action_type="UNLOCK", details="Vault unlocked successfully")
 
                 # Best-effort: remove local transient names (we still keep the buffers via attributes)
                 try:
@@ -465,6 +662,12 @@ class VaultController:
                     self.db.update_unlock_timestamp()
                 except Exception as e:
                     warnings.warn(f"Failed to update unlock timestamp: {e}", RuntimeWarning)
+
+                # --- Migration: Metadata Encryption (v2.1) ---
+                try:
+                    self.db.migrate_entries_metadata(bytes(self.vault_key_secure))
+                except Exception as e:
+                    warnings.warn(f"Metadata migration failed (non-fatal): {e}", RuntimeWarning)
 
                 return True
 
@@ -520,37 +723,67 @@ class VaultController:
                     setattr(self, secure_attr, None)
 
             self.is_unlocked = False
+            self.db.add_audit_log(action_type="LOCK", details="Vault locked")
+            
             if errors:
                 raise CriticalVaultError(f"Partial lock state! Security warning: {', '.join(errors)}")
             return True
 
-    def self_destruct(self) -> None:
+    def execute_self_destruct(self) -> None:
         """
-        Permanently and physically delete the entire vault database.
+        Permanently and physically delete the entire vault database and all backups.
         This is IRREVERSIBLE.
         """
         import os
         db_path = self.db.db_path
 
-        # 1. First lock to clear memory
+        # 1. Fetch all backups to delete them too
+        backups_to_delete = []
+        try:
+            # Try to get backup filenames from history
+            cursor = self.db.connect().execute("SELECT filename FROM backup_history")
+            backups_to_delete = [row['filename'] for row in cursor.fetchall() if row['filename']]
+        except Exception:
+            pass # DB might be locked or corrupt, proceed with core deletion
+
+        # 2. Add final CRITICAL audit event (to internal log before wipe)
+        try:
+            self.db.add_audit_log(
+                action_type="VAULT_SELF_DESTRUCT_INITIATED",
+                severity="Critical",
+                details="Manual or automatic self-destruct triggered. Irreversible wipe starting."
+            )
+        except Exception:
+            pass
+
+        # 3. Securely lock vault (clears secure memory)
         self.lock_vault()
 
-        # 2. Close database connection
+        # 4. Close database connection
         try:
             self.db.close()
         except Exception:
             pass
 
-        # 3. Physically delete the file
+        # 5. Destroy Backups
+        for b_file in backups_to_delete:
+            if b_file and os.path.exists(b_file):
+                try:
+                    os.remove(b_file)
+                except Exception:
+                    pass
+
+        # 6. Physically delete the vault database file
         if os.path.exists(db_path):
             try:
                 os.remove(db_path)
             except Exception as e:
-                raise CriticalVaultError(f"Self-destruct failed while deleting file: {e}")
+                # If we fail here, the system is in a dangerous partial state
+                raise CriticalVaultError(f"Self-destruct failed while deleting database: {e}")
 
-        # 4. Burn the bridges
+        # 7. Physical termination of session
         raise VaultDestroyedError(
-            "CRITICAL: The vault has self-destructed. The database file has been deleted."
+            "CRITICAL: The vault has self-destructed. All data has been annihilated."
         )
 
     def get_config(self, key: str) -> Optional[Any]:
@@ -613,12 +846,36 @@ class VaultController:
             vault_key = bytes(self.vault_key_secure)
             entry = self.db.get_entry(entry_id, vault_key, include_deleted=include_deleted)
             
-            if entry is None:
-                return None 
+            if entry:
+                # Log the view event
+                self.add_audit_log(
+                    action_type="VIEW_SECRET", 
+                    entry_id=entry_id, 
+                    details=f"Viewed secret for: {entry.get('title')}"
+                )
             
             return entry
         except Exception as e:
             raise VaultError(f"Failed to retrieve password entry: {e}") from e
+
+    def copy_secret(self, entry_id: str) -> str:
+        """
+        Retrieves a secret and logs a COPY_SECRET audit event.
+        """
+        self._check_unlocked()
+        try:
+            vault_key = bytes(self.vault_key_secure)
+            entry = self.db.get_entry(entry_id, vault_key)
+            if entry:
+                # Log the copy event
+                self.add_audit_log(
+                    action_type="COPY_SECRET", 
+                    entry_id=entry_id, 
+                    details=f"Copied secret for: {entry.get('title')}"
+                )
+            return entry.get("password", "")
+        except Exception as e:
+            raise VaultError(f"Failed to copy secret: {e}")
 
     def search_entries(
             self, 
@@ -640,10 +897,34 @@ class VaultController:
                 raise VaultError("Limit exceeds maximum allowed (1000)")
             if offset < 0:
                 offset = 0
-            return self.db.search_entries(query, include_deleted, limit, offset)
+            
+            vault_key = bytes(self.vault_key_secure)
+            return self.db.search_entries(vault_key, query, include_deleted, limit, offset)
         except Exception as e:
             raise VaultError(f"Failed to search entries: {e}")
     
+    def add_audit_log(
+        self, 
+        action_type: str, 
+        entry_id: Optional[str] = None, 
+        details: Optional[str] = None,
+        severity: str = "Info"
+    ) -> None:
+        """
+        Wrapper to log security events with session context.
+        """
+        # In a real app, 'actor' and 'ip' would come from the current session/request
+        # For now, we use sensible defaults that the UI can then display.
+        self.db.add_audit_log(
+            action_type=action_type,
+            entry_id=entry_id,
+            details=details,
+            actor="admin",       # Default actor for Web/CLI actions
+            source="Web UI",     # Default source
+            severity=severity,
+            ip_address="127.0.0.1"
+        )
+
     def view_audit_log(self) -> List[Dict]:
         """
         View the security audit trail of the vault.
@@ -657,6 +938,7 @@ class VaultController:
     def list_entries(
         self, 
         include_deleted: bool = False,
+        only_deleted: bool = False,
         limit: int = 100,
         category: str = None,
         favorite: bool = None,
@@ -671,6 +953,7 @@ class VaultController:
         try:
             return self.db.list_entries(
                 include_deleted=include_deleted,
+                only_deleted=only_deleted,
                 category=category,
                 favorite=favorite,
                 limit=limit,
@@ -786,10 +1069,166 @@ class VaultController:
             vault_keys=vault_keys,
             hierarchy_keys={'vault_key': internal_vault_key}
         )
+
+    def create_backup(self, file_path: str) -> bool:
+        """
+        Create an encrypted backup file.
+        Logs to backup_history and audit_log.
+        """
+        self._check_unlocked()
+        import os
+        
+        try:
+            bm = self.create_backup_manager()
+            success = bm.create_backup(file_path)
+            
+            if success:
+                file_size = os.path.getsize(file_path)
+                self.db.add_backup_history_entry(
+                   operation_type="CREATED_BACKUP",
+                   filename=os.path.basename(file_path),
+                   file_size=file_size,
+                   status="Success",
+                   details="Encrypted backup file created successfully."
+                )
+                self.add_audit_log(
+                    action_type="CREATE_BACKUP",
+                    details=f"Backup created: {os.path.basename(file_path)}",
+                    severity="Info"
+                )
+            return success
+        except Exception as e:
+            self.db.add_backup_history_entry(
+                operation_type="CREATED_BACKUP",
+                filename=os.path.basename(file_path),
+                status="Failed",
+                details=str(e)
+            )
+            raise VaultError(f"Failed to create backup: {e}")
+
+    def restore_backup(self, file_path: str) -> bool:
+        """
+        Restore vault from an encrypted backup file.
+        Logs to backup_history and audit_log.
+        """
+        self._check_unlocked()
+        import os
+        
+        try:
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            bm = self.create_backup_manager()
+            success = bm.restore_backup(file_path)
+            
+            if success:
+                self.db.add_backup_history_entry(
+                   operation_type="IMPORTED_BACKUP",
+                   filename=os.path.basename(file_path),
+                   file_size=file_size,
+                   status="Success",
+                   details="Vault restored from encrypted backup successfully."
+                )
+                self.add_audit_log(
+                    action_type="RESTORE_BACKUP",
+                    details=f"Vault restored from {os.path.basename(file_path)}",
+                    severity="Warning" # Major state change
+                )
+            return success
+        except Exception as e:
+            self.db.add_backup_history_entry(
+                operation_type="IMPORTED_BACKUP",
+                filename=os.path.basename(file_path),
+                file_size=file_size,
+                status="Failed",
+                details=str(e)
+            )
+            raise VaultError(f"Failed to restore backup: {e}")
     
     def get_old_entries(self, days_threshold: int = 90):
         self._check_unlocked()
         return self.db.get_old_entries(days_threshold)
+
+    def get_security_analysis(self) -> Dict:
+        """
+        Perform a full security scan of all vault entries.
+        Detects weak passwords, reuses, and aging credentials.
+        Calculates an overall security score (0-100).
+        """
+        self._check_unlocked()
+        try:
+            vault_key = bytes(self.vault_key_secure)
+            entries = self.db.get_all_active_entries(vault_key)
+            
+            analysis = {
+                "weak": [],
+                "reused": [],
+                "aging": [],
+                "total_entries": len(entries),
+                "total_score": 100,
+                "status": "Good"
+            }
+            
+            if not entries:
+                return analysis
+
+            password_map = {}
+            unique_reused_ids = set()
+            
+            for entry in entries:
+                password = entry.get('password', '')
+                strength = entry.get('password_strength', 0)
+                age_days = entry.get('password_age_days', 0)
+                
+                summary = {
+                    "id": entry["id"],
+                    "title": entry["title"],
+                    "url": entry["url"],
+                    "username": entry["username"],
+                    "modified_at": entry["modified_at"],
+                    "password_strength": strength,
+                    "age_days": age_days
+                }
+                
+                if strength < 50:
+                    analysis['weak'].append(summary)
+                    
+                if age_days > 90:
+                    analysis['aging'].append(summary)
+                    
+                if password:
+                    if password not in password_map:
+                        password_map[password] = []
+                    password_map[password].append(summary)
+
+            for pwd, matches in password_map.items():
+                if len(matches) > 1:
+                    analysis['reused'].extend(matches)
+                    for m in matches:
+                        unique_reused_ids.add(m["id"])
+
+            # --- Score Calculation ---
+            # -10 per weak password
+            # -15 per reused password (unique entries)
+            # -2 per aging credential (capped at 50)
+            score = 100
+            score -= len(analysis['weak']) * 10
+            score -= len(unique_reused_ids) * 15
+            
+            aging_deduction = min(len(analysis['aging']) * 2, 50)
+            score -= aging_deduction
+            
+            analysis["total_score"] = max(0, score)
+            
+            # Status mapping
+            if analysis["total_score"] >= 80:
+                analysis["status"] = "Good"
+            elif analysis["total_score"] >= 60:
+                analysis["status"] = "Warning"
+            else:
+                analysis["status"] = "Critical"
+            
+            return analysis
+        except Exception as e:
+            raise VaultError(f"Security analysis failed: {e}")
 
     def hard_delete_entry(self, entry_id: str) -> bool:
         """
@@ -801,6 +1240,22 @@ class VaultController:
         except Exception as e:
             raise VaultError(f"Failed to hard delete entry: {e}")
 
+    def empty_trash(self) -> int:
+        """
+        Permanently remove all entries from trash.
+        """
+        self._check_unlocked()
+        try:
+            count = self.db.empty_trash()
+            if count > 0:
+                self.db.add_audit_log(
+                    action_type="EMPTY_TRASH",
+                    details=f"Permanently purged {count} deleted entries."
+                )
+            return count
+        except Exception as e:
+            raise VaultError(f"Failed to empty trash: {e}")
+
     def import_csv(self, file_path: str) -> Tuple[int, int]:
         """
         Import entries from a CSV file.
@@ -808,22 +1263,20 @@ class VaultController:
         """
         self._check_unlocked()
         import csv
+        import os
 
         success_count = 0
         fail_count = 0
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                # Use DictReader to automatically handle headers
                 reader = csv.DictReader(f)
-
-                # Normalize headers (strip whitespace)
                 if reader.fieldnames:
                     reader.fieldnames = [name.strip() for name in reader.fieldnames]
 
                 for row in reader:
                     try:
-                        # Robust column fetching (Case-insensitive fallback)
                         def get_val(keys):
                             for k in keys:
                                 if k in row and row[k]:
@@ -832,7 +1285,6 @@ class VaultController:
 
                         title = get_val(['Title', 'title', 'name', 'Name'])
                         if not title:
-                            # Skip rows without a title
                             fail_count += 1
                             continue
 
@@ -849,10 +1301,108 @@ class VaultController:
                     except Exception:
                         fail_count += 1
 
+            # Log to History and Audit
+            status = "Success" if fail_count == 0 else "Partial Success"
+            details = f"Imported {success_count} entries. {fail_count} failed."
+            
+            self.db.add_backup_history_entry(
+                operation_type="IMPORTED_CSV",
+                filename=os.path.basename(file_path),
+                file_size=file_size,
+                status=status,
+                details=details
+            )
+            
+            self.add_audit_log(
+                action_type="IMPORT_CSV",
+                details=details,
+                severity="Info"
+            )
+
             return success_count, fail_count
 
         except Exception as e:
+            self.db.add_backup_history_entry(
+                operation_type="IMPORTED_CSV",
+                filename=os.path.basename(file_path),
+                file_size=file_size,
+                status="Failed",
+                details=str(e)
+            )
             raise VaultError(f"Failed to read CSV file: {e}")
+
+    def export_csv(self, file_path: str) -> int:
+        """
+        Export vault contents to a plaintext CSV file.
+        DANGEROUS: Data is unencrypted.
+        """
+        self._check_unlocked()
+        import csv
+        import os
+
+        def sanitize_csv_field(text: str) -> str:
+            if not text: return ""
+            forbidden_prefixes = ('=', '+', '-', '@', '|', '%')
+            stripped = text.lstrip()
+            # 1. Neutralize Formulas (Improves on older implementation)
+            if stripped.startswith(forbidden_prefixes):
+                return "'" + text
+            # 2. Neutralize Control Characters
+            safe_text = text.replace('\t', '    ').replace('\r', ' ').replace('\n', ' ')
+            return safe_text
+
+        try:
+            entries = self.db.list_entries(include_deleted=False)
+            vault_key = bytes(self.vault_key_secure)
+            
+            export_count = 0
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'title', 'url', 'username', 'password', 'notes', 'category', 'tags'
+                ])
+                writer.writeheader()
+
+                for entry_meta in entries:
+                    # Get complete entry with decrypted password/notes
+                    entry = self.db.get_entry(entry_meta['id'], vault_key)
+                    if entry:
+                        writer.writerow({
+                            'title': sanitize_csv_field(entry.get('title', '')),
+                            'url': sanitize_csv_field(entry.get('url', '')),
+                            'username': sanitize_csv_field(entry.get('username', '')),
+                            'password': sanitize_csv_field(entry.get('password', '')),
+                            'notes': sanitize_csv_field(entry.get('notes', '')),
+                            'category': sanitize_csv_field(entry.get('category', '')),
+                            'tags': sanitize_csv_field(entry.get('tags', ''))
+                        })
+                        export_count += 1
+
+            file_size = os.path.getsize(file_path)
+            
+            self.db.add_backup_history_entry(
+                operation_type="EXPORTED_CSV",
+                filename=os.path.basename(file_path),
+                file_size=file_size,
+                status="Success",
+                details=f"Exported {export_count} entries to plaintext CSV."
+            )
+            
+            self.add_audit_log(
+                action_type="EXPORT_CSV",
+                details=f"Plaintext export created for {export_count} entries.",
+                severity="Warning" # Plaintext export is a security risk
+            )
+            
+            return export_count
+
+        except Exception as e:
+            self.db.add_backup_history_entry(
+                operation_type="EXPORTED_CSV",
+                filename=os.path.basename(file_path),
+                status="Failed",
+                details=str(e)
+            )
+            raise VaultError(f"Failed to export CSV: {e}")
 
     # ================================================================
     # Account Recovery
@@ -881,28 +1431,41 @@ class VaultController:
         self._check_unlocked()
         with self._state_lock:
             vault_key = bytes(self.vault_key_secure)
+        if len(vault_key) != 32:
+            raise VaultError("Secure vault key is invalid size")
         self.recovery_manager.setup_passphrase(vault_key, passphrase)
+        
+        self.add_audit_log(
+            action_type="RECOVERY_PASSPHRASE_UPDATE",
+            details="Recovery passphrase was set or updated.",
+            severity="Info"
+        )
 
     def setup_recovery_codes(self, count: int = 8) -> list:
         """
-        Generate one-time recovery codes and encrypt vault_key under each.
+        Generate one-time recovery codes and store them encrypted.
         Requires vault to be unlocked.
 
         Args:
-            count: Number of codes to generate (1–16).
+            count: Number of codes to generate (1-16).
 
         Returns:
-            List of plaintext code strings — user must store these offline.
-
-        Raises:
-            VaultLockedError: Vault is not unlocked.
-            ValueError:       Invalid count.
-            RecoveryError / DatabaseError: On failure.
+            List of plaintext codes.
         """
         self._check_unlocked()
         with self._state_lock:
             vault_key = bytes(self.vault_key_secure)
-        return self.recovery_manager.setup_codes(vault_key, count)
+        if len(vault_key) != 32:
+            raise VaultError("Secure vault key is invalid size")
+
+        codes = self.recovery_manager.setup_codes(vault_key, count)
+        
+        self.add_audit_log(
+            action_type="RECOVERY_CODES_GENERATE",
+            details=f"Generated {len(codes)} new recovery codes.",
+            severity="Warning" # Higher friction as old codes are invalidated
+        )
+        return codes
 
     def recover_vault(self, credential: str, credential_type: str,
                       new_password: str) -> bool:
@@ -1021,14 +1584,44 @@ class VaultController:
 
     def disable_recovery(self) -> None:
         """
-        Remove all recovery credentials.  Requires vault to be unlocked.
-
-        Raises:
-            VaultLockedError: Vault is not unlocked.
-            DatabaseError:    On DB failure.
+        Remove all recovery credentials. Requires vault to be unlocked.
         """
         self._check_unlocked()
         self.recovery_manager.disable_recovery()
+        self.add_audit_log(
+            action_type="RECOVERY_DISABLE",
+            details="Account recovery options were disabled.",
+            severity="Warning"
+        )
+
+    def reset_recovery(self) -> None:
+        """
+        Permanently clear all recovery configurations. 
+        Requires vault to be unlocked.
+        """
+        self._check_unlocked()
+        self.recovery_manager.disable_recovery() # Re-use deletion logic
+        self.add_audit_log(
+            action_type="RECOVERY_RESET",
+            details="Recovery system was reset to factory defaults.",
+            severity="Warning"
+        )
+
+    def verify_password(self, password: str) -> bool:
+        """
+        Verify the provided password matches the master password of correctly unlocked vault.
+        Used for re-authentication before sensitive operations.
+        """
+        self._check_unlocked()
+        try:
+            conn = self.db.connect()
+            row = conn.execute("SELECT salt, auth_hash FROM vault_metadata WHERE id = 1").fetchone()
+            if not row:
+                return False
+            
+            return verify_auth_hash(row['auth_hash'], password, row['salt'])
+        except Exception:
+            return False
 
     def get_recovery_status(self) -> dict:
         """
@@ -1039,3 +1632,50 @@ class VaultController:
             {enabled, type, codes_total, codes_remaining}
         """
         return self.recovery_manager.get_status()
+
+    # ======== Multi-Vault Registry (New) ========
+
+    def get_registered_vaults(self) -> List[Dict]:
+        """
+        Get list of all registered vaults from the system controller.
+        Requires vault to be unlocked.
+        """
+        self._check_unlocked()
+        try:
+            conn = self.db.connect()
+            cursor = conn.execute("SELECT nickname, path, created_at, last_accessed_at FROM vault_registry ORDER BY nickname")
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            raise VaultError(f"Failed to retrieve vault registry: {e}")
+
+    def register_vault(self, nickname: str, path: str) -> bool:
+        """
+        Register a new or existing vault in the system registry.
+        Requires vault to be unlocked.
+        """
+        import os
+        self._check_unlocked()
+        try:
+            conn = self.db.connect()
+            conn.execute(
+                "INSERT OR REPLACE INTO vault_registry (nickname, path) VALUES (?, ?)",
+                (nickname, os.path.abspath(path))
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            raise VaultError(f"Failed to register vault: {e}")
+
+    def unregister_vault(self, nickname: str) -> bool:
+        """
+        Remove a vault from the system registry.
+        Requires vault to be unlocked.
+        """
+        self._check_unlocked()
+        try:
+            conn = self.db.connect()
+            conn.execute("DELETE FROM vault_registry WHERE nickname = ?", (nickname,))
+            conn.commit()
+            return True
+        except Exception as e:
+            raise VaultError(f"Failed to unregister vault: {nickname}: {e}")

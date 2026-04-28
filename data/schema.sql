@@ -24,10 +24,16 @@ CREATE TABLE IF NOT EXISTS vault_metadata (
     kdf_config TEXT NOT NULL CHECK (json_valid(kdf_config)),      -- JSON string of KDF parameters (time_cost, memory_cost, etc.)       
     
     -- Metadata
+    display_name TEXT,                      -- User-friendly name
+    description TEXT,                       -- Optional purpose/notes
+    username TEXT DEFAULT 'admin',          -- User identity
+    account_status TEXT DEFAULT 'Active',   -- Active, Suspended, Pending
+    preferences TEXT DEFAULT '{}',          -- JSON for UI settings
+    auto_lock_duration INTEGER DEFAULT 900, -- Seconds (Default 15m)
     created_at TEXT NOT NULL,               -- ISO 8601
     last_unlocked_at TEXT,                  
     unlock_count INTEGER DEFAULT 0 CHECK (unlock_count >= 0),
-    version TEXT DEFAULT '2.0'              
+    version TEXT DEFAULT '2.3'              
 );
 
 -- ============================================================================
@@ -35,11 +41,24 @@ CREATE TABLE IF NOT EXISTS vault_metadata (
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS entries (
     id TEXT PRIMARY KEY,                    
-    title TEXT NOT NULL,                    
-    url TEXT,                               
-    username TEXT,                          
+    title TEXT,                             -- Legacy plaintext title (null if encrypted)
+    url TEXT,                               -- Legacy plaintext URL
+    username TEXT,                          -- Legacy plaintext username
     
-    -- Encryption Data
+    -- Encrypted Metadata (v2.1)
+    title_encrypted BLOB,
+    title_nonce BLOB,
+    title_tag BLOB,
+    
+    url_encrypted BLOB,
+    url_nonce BLOB,
+    url_tag BLOB,
+    
+    username_encrypted BLOB,
+    username_nonce BLOB,
+    username_tag BLOB,
+
+    -- Encryption Data (Secrets)
     password_encrypted BLOB NOT NULL,       
     password_nonce BLOB NOT NULL,           
     password_tag BLOB NOT NULL,             
@@ -108,8 +127,13 @@ CREATE TABLE IF NOT EXISTS metadata (
 -- Tracks creation, updates, and deletion of entries for forensic auditing
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id TEXT NOT NULL,
-    action_type TEXT NOT NULL CHECK (action_type IN ('CREATE', 'UPDATE', 'SOFT_DELETE', 'RESTORE', 'HARD_DELETE')),
+    entry_id TEXT,                          -- Can be NULL for global events (login, etc)
+    action_type TEXT NOT NULL,              -- e.g., 'CREATE', 'UNLOCK', 'VIEW_SECRET'
+    actor TEXT DEFAULT 'system',            -- e.g., 'admin', 'user.name', 'system'
+    source TEXT DEFAULT 'Internal',         -- e.g., 'Web UI', 'CLI', 'API'
+    severity TEXT DEFAULT 'Info',           -- 'Info', 'Warning', 'Error'
+    ip_address TEXT DEFAULT '127.0.0.1',    
+    details TEXT,                           -- Optional extra info
     timestamp TEXT DEFAULT (datetime('now'))
 );
 
@@ -118,6 +142,18 @@ ON audit_log(timestamp DESC);
 
 CREATE INDEX IF NOT EXISTS idx_audit_entry_id
 ON audit_log(entry_id);
+
+-- Prune audit logs to last 1000 events to prevent bloat
+CREATE TRIGGER IF NOT EXISTS prune_audit_log
+AFTER INSERT ON audit_log
+BEGIN
+    DELETE FROM audit_log
+    WHERE id NOT IN (
+        SELECT id FROM audit_log
+        ORDER BY timestamp DESC
+        LIMIT 1000
+    );
+END;
 
 
 
@@ -196,8 +232,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 -- 1. INSERT: Add to FTS only if not deleted. Add Audit Log.
 CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries 
 BEGIN
-    INSERT INTO entries_fts(rowid, id, title, url, username, tags)
-    SELECT new.rowid, new.id, new.title, new.url, new.username, new.tags
+    INSERT INTO entries_fts(rowid, id, tags)
+    SELECT new.rowid, new.id, new.tags
     WHERE new.is_deleted = 0;
 
     INSERT INTO audit_log (entry_id, action_type) VALUES (new.id, 'CREATE');
@@ -207,12 +243,12 @@ END;
 CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries 
 BEGIN
     -- If content changed and Entry is ACTIVE: Update FTS
-    INSERT INTO entries_fts(entries_fts, rowid, id, title, url, username, tags)
-    SELECT 'delete', old.rowid, old.id, old.title, old.url, old.username, old.tags
+    INSERT INTO entries_fts(entries_fts, rowid, id, tags)
+    SELECT 'delete', old.rowid, old.id, old.tags
     WHERE old.is_deleted = 0;
 
-    INSERT INTO entries_fts(rowid, id, title, url, username, tags)
-    SELECT new.rowid, new.id, new.title, new.url, new.username, new.tags
+    INSERT INTO entries_fts(rowid, id, tags)
+    SELECT new.rowid, new.id, new.tags
     WHERE new.is_deleted = 0;
 
     -- Audit Logging Logic
@@ -229,8 +265,8 @@ CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries
 BEGIN
     -- Only remove from FTS if it wasn't already in the trash (is_deleted=0)
     -- This prevents "double delete" corruption in the index.
-    INSERT INTO entries_fts(entries_fts, rowid, id, title, url, username, tags)
-    SELECT 'delete', old.rowid, old.id, old.title, old.url, old.username, old.tags
+    INSERT INTO entries_fts(entries_fts, rowid, id, tags)
+    SELECT 'delete', old.rowid, old.id, old.tags
     WHERE old.is_deleted = 0;
 
     INSERT INTO audit_log (entry_id, action_type) VALUES (old.id, 'HARD_DELETE');
@@ -251,3 +287,27 @@ BEGIN
     DELETE FROM totp_attempts
     WHERE attempt_ts < CAST(strftime('%s','now','-1 day') AS INTEGER);
 END;
+
+-- ============================================================================
+-- TABLE 8: vault_registry (For Multi-Vault Manager)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS vault_registry (
+    nickname TEXT PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT (datetime('now')),
+    last_accessed_at TEXT
+);
+-- ============================================================================
+-- TABLE 9: backup_history (Maintenance Tracking)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS backup_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now')),
+    operation_type TEXT NOT NULL, -- 'CREATED_BACKUP', 'IMPORTED_BACKUP', 'IMPORTED_CSV', 'EXPORTED_CSV'
+    filename TEXT,
+    file_size INTEGER,            -- in bytes
+    status TEXT DEFAULT 'Success', -- 'Success', 'Failed', 'In Progress'
+    details TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_history_timestamp ON backup_history(timestamp DESC);

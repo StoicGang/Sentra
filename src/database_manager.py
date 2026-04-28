@@ -6,7 +6,7 @@ Handles SQLit operations with encrypted entry storage and hierarchical key manag
 import sqlite3
 import os
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import threading
 import re
 import json
@@ -215,7 +215,134 @@ class DatabaseManager:
                 schema_sql = f.read()
 
             conn.execute("BEGIN IMMEDIATE;")
-            conn.executescript(schema_sql)   # Schema already includes lockout_attempts
+            conn.executescript(schema_sql) 
+            
+            # --- Migration Section: Robust Audit Log Upgrade ---
+            try:
+                # Check for existing structure
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+                if cursor.fetchone():
+                    cursor = conn.execute("PRAGMA table_info(audit_log)")
+                    columns = {row[1]: row for row in cursor.fetchall()}
+                    
+                    needs_table_recreation = False
+                    if 'details' not in columns:
+                        needs_table_recreation = True
+                    elif columns['entry_id'][3] == 1: # entry_id is NOT NULL
+                        needs_table_recreation = True
+                    elif 'actor' not in columns: # Check for Phase 27 fields
+                        needs_table_recreation = True
+                    
+                    if needs_table_recreation:
+                        # Rename old, create new
+                        conn.execute("ALTER TABLE audit_log RENAME TO audit_log_old")
+                        conn.execute("""
+                            CREATE TABLE audit_log (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                entry_id TEXT,                          
+                                action_type TEXT NOT NULL,
+                                actor TEXT DEFAULT 'system',
+                                source TEXT DEFAULT 'Internal',
+                                severity TEXT DEFAULT 'Info',
+                                ip_address TEXT DEFAULT '127.0.0.1',
+                                details TEXT,                           
+                                timestamp TEXT DEFAULT (datetime('now'))
+                            )
+                        """)
+                        
+                        # Migration logic: map old columns and provide defaults for new ones
+                        old_cols = columns.keys()
+                        mapping = ["id", "entry_id", "action_type", "timestamp"]
+                        if 'details' in old_cols: mapping.append("details")
+                        
+                        source_cols = ", ".join(mapping)
+                        target_cols = ", ".join(mapping)
+                        
+                        conn.execute(f"""
+                            INSERT INTO audit_log ({target_cols})
+                            SELECT {source_cols} FROM audit_log_old
+                        """)
+                        conn.execute("DROP TABLE audit_log_old")
+                        
+                        # --- CRITICAL: Recreate triggers ---
+                        # When we renamed audit_log to audit_log_old, SQLite automatically 
+                        # updated existing triggers to point to audit_log_old. 
+                        # We must drop and recreate them to point back to the new audit_log.
+                        conn.execute("DROP TRIGGER IF EXISTS entries_ai")
+                        conn.execute("DROP TRIGGER IF EXISTS entries_au")
+                        conn.execute("DROP TRIGGER IF EXISTS entries_ad")
+                        
+                        # Note: These will be recreated by the schema_sql executescript above 
+                        # ONLY IF they don't exist. Since we just dropped them, we should 
+                        # re-run the schema or just explicitly define them here. 
+                        # To be safe, we re-run the trigger part of the schema.
+                        conn.executescript(schema_sql)
+            except Exception as e:
+                # Log but maybe don't crash everything if migration fails? 
+                # Actually, better to raise so user knows why audit logging is broken.
+                raise DatabaseError(f"Audit log migration failed: {e}")
+
+            # --- Migration Section: Metadata Encryption (v2.1) ---
+            try:
+                cursor = conn.execute("PRAGMA table_info(entries)")
+                columns = {row[1] for row in cursor.fetchall()}
+                
+                if 'title_encrypted' not in columns:
+                    conn.execute("ALTER TABLE entries ADD COLUMN title_encrypted BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN title_nonce BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN title_tag BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN url_encrypted BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN url_nonce BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN url_tag BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN username_encrypted BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN username_nonce BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN username_tag BLOB")
+            except Exception as e:
+                raise DatabaseError(f"Metadata schema upgrade failed: {e}")
+
+            # --- Migration Section: Maintenance History (v2.2) ---
+            try:
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='backup_history'")
+                if not cursor.fetchone():
+                    # Table will be created by schema_sql, but we can explicitly run it if needed
+                    # but since executescript(schema_sql) was called at line 218, it might already be there.
+                    # However, PRAGMA journal_mode = WAL etc. at start of schema might cause issues if run twice.
+                    # The executescript at 218 handled it for NEW users. Existing users need this check.
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS backup_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT DEFAULT (datetime('now')),
+                            operation_type TEXT NOT NULL,
+                            filename TEXT,
+                            file_size INTEGER,
+                            status TEXT DEFAULT 'Success',
+                            details TEXT
+                        )
+                    """)
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_backup_history_timestamp ON backup_history(timestamp DESC)")
+            except Exception as e:
+                raise DatabaseError(f"Backup history schema upgrade failed: {e}")
+            
+            # --- Migration Section: Rich Vault Metadata (v2.3) ---
+            try:
+                cursor = conn.execute("PRAGMA table_info(vault_metadata)")
+                columns = {row[1] for row in cursor.fetchall()}
+                
+                if 'display_name' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN display_name TEXT")
+                if 'description' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN description TEXT")
+                if 'username' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN username TEXT DEFAULT 'admin'")
+                if 'account_status' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN account_status TEXT DEFAULT 'Active'")
+                if 'preferences' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN preferences TEXT DEFAULT '{}'")
+                if 'auto_lock_duration' not in columns:
+                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN auto_lock_duration INTEGER DEFAULT 900")
+            except Exception as e:
+                raise DatabaseError(f"Vault metadata schema upgrade failed: {e}")
+            
             conn.commit()
             return True
 
@@ -230,7 +357,9 @@ class DatabaseManager:
             vault_key_encrypted: bytes, 
             vault_key_nonce: bytes, 
             vault_key_tag:bytes,
-            kdf_config: Optional[Dict] = None
+            kdf_config: Optional[Dict] = None,
+            display_name: Optional[str] = None,
+            description: Optional[str] = None
     ) -> bool:
         conn = self.connect()
 
@@ -246,19 +375,21 @@ class DatabaseManager:
                 INSERT INTO vault_metadata (
                     id, salt, auth_hash, 
                     vault_key_encrypted, vault_key_nonce, vault_key_tag,
-                    kdf_config,
+                    kdf_config, display_name, description,
+                    username, account_status, preferences, auto_lock_duration,
                     created_at, version,
                     unlock_count, last_unlocked_at
                 ) VALUES (
-                    1, ?, ?, ?, ?, ?, ?, 
+                    1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', '{}', 900,
                     datetime('now'),    -- Use SQLite timestamp
-                    '2.0', 
+                    '2.3', 
                     0, NULL
                 )
             """, (
                 salt, auth_hash,
                 vault_key_encrypted, vault_key_nonce, vault_key_tag,
-                kdf_json
+                kdf_json, display_name, description,
+                "admin" # Default username
             ))
             
             conn.commit()
@@ -300,19 +431,50 @@ class DatabaseManager:
     def update_unlock_timestamp(self) -> bool:
         conn = self.connect()
         timestamp = datetime.now().isoformat()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute("""
+                UPDATE vault_metadata
+                SET last_unlocked_at = ?, unlock_count = unlock_count + 1
+                WHERE id = 1
+            """, (timestamp,))
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn: conn.rollback()
+            raise DatabaseError(f"Failed to update unlock timestamp: {e}")
 
+    def get_session_history(self, limit: int = 10) -> List[Dict]:
+        """
+        Reconstruct session history from audit logs.
+        """
+        conn = self.connect()
         cursor = conn.execute("""
-            UPDATE vault_metadata
-            SET last_unlocked_at = ?, unlock_count = unlock_count + 1
-            WHERE id = 1
-        """, (timestamp,))
+            SELECT id, action_type, timestamp, ip_address, details
+            FROM audit_log
+            WHERE action_type IN ('UNLOCK', 'LOCK', 'failed_unlock')
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
 
-        conn.commit()
-
-        if cursor.rowcount == 0:
-            raise DatabaseError("Vault metadata missing during unlock timestamp update")
-
-        return cursor.rowcount > 0 # True if row was updated
+    def update_metadata_field(self, field: str, value: Any) -> bool:
+        """
+        Update a specific field in the vault_metadata table.
+        """
+        allowed_fields = ['display_name', 'description', 'username', 'account_status', 'preferences', 'auto_lock_duration']
+        if field not in allowed_fields:
+            raise DatabaseError(f"Field {field} is not allowed for update")
+        
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(f"UPDATE vault_metadata SET {field} = ? WHERE id = 1", (value,))
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn: conn.rollback()
+            raise DatabaseError(f"Failed to update {field}: {e}")
     
     def add_entry(
             self, 
@@ -350,7 +512,24 @@ class DatabaseManager:
             # Derive the entry key
             entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
             
-            # 1. Encrypt Password
+            # 1. Encrypt Metadata
+            title_cipher, title_nonce, title_tag = encrypt_entry(
+                title, entry_key, associated_data=entry_id.encode("utf-8")
+            )
+            
+            url_cipher, url_nonce, url_tag = None, None, None
+            if url:
+                url_cipher, url_nonce, url_tag = encrypt_entry(
+                    url, entry_key, associated_data=entry_id.encode("utf-8")
+                )
+                
+            username_cipher, username_nonce, username_tag = None, None, None
+            if username:
+                username_cipher, username_nonce, username_tag = encrypt_entry(
+                    username, entry_key, associated_data=entry_id.encode("utf-8")
+                )
+
+            # 2. Encrypt Password
             pw_payload = {"password": password or ""}
             pw_cipher, pw_nonce, pw_tag = encrypt_entry(
                 json.dumps(pw_payload),
@@ -358,7 +537,7 @@ class DatabaseManager:
                 associated_data=entry_id.encode("utf-8")
             )
             
-            # 2. Encrypt Notes
+            # 3. Encrypt Notes
             notes_payload = {"notes": notes or ""}
             notes_cipher, notes_nonce, notes_tag = encrypt_entry(
                 json.dumps(notes_payload),
@@ -371,14 +550,20 @@ class DatabaseManager:
             conn.execute("""
                 INSERT INTO entries (
                     id, title, url, username,
+                    title_encrypted, title_nonce, title_tag,
+                    url_encrypted, url_nonce, url_tag,
+                    username_encrypted, username_nonce, username_tag,
                     password_encrypted, password_nonce, password_tag,
                     notes_encrypted, notes_nonce, notes_tag,
                     kdf_salt,
                     tags, category, created_at, modified_at,
                     favorite, password_strength
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?)
+                ) VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?)
             """, (
-                entry_id, title, url, username,
+                entry_id, 
+                title_cipher, title_nonce, title_tag,
+                url_cipher, url_nonce, url_tag,
+                username_cipher, username_nonce, username_tag,
                 pw_cipher, pw_nonce, pw_tag,          
                 notes_cipher, notes_nonce, notes_tag, 
                 entry_salt,
@@ -428,8 +613,81 @@ class DatabaseManager:
                 raise DatabaseError("Database integrity error: Missing salt for entry.")
 
             entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
+            return self._decrypt_row(row, entry_key)
             
-            # Decrypt password field
+        except ValueError as e:
+            raise DatabaseError(f"Invalid input: {str(e)}")
+        except sqlite3.OperationalError as e:
+            raise DatabaseError(f"Database query failed: {str(e)}")
+        except Exception as e:
+            raise DatabaseError(f"Failed to retrieve entry: {e}")
+
+    def get_all_active_entries(self, vault_key: bytes) -> List[Dict]:
+        """
+        Retrieves and decrypts all non-deleted entries.
+        """
+        if not isinstance(vault_key, bytes) or len(vault_key) != 32:
+            raise ValueError("Vault key must be 32 bytes")
+
+        try:
+            conn = self.connect()
+            cursor = conn.execute("SELECT * FROM entries WHERE is_deleted = 0")
+            rows = cursor.fetchall()
+            
+            results = []
+            for row in rows:
+                try:
+                    entry_id = row["id"]
+                    entry_salt = row["kdf_salt"]
+                    entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
+                    entry = self._decrypt_row(row, entry_key)
+                    results.append(entry)
+                except Exception:
+                    # Skip corrupt entries during bulk scan
+                    continue
+            return results
+        except Exception as e:
+            raise DatabaseError(f"Failed to retrieve all active entries: {e}")
+
+    def _decrypt_row(self, row: sqlite3.Row, entry_key: bytes) -> Dict:
+        """Helper to decrypt all fields in a row."""
+        entry_id = row["id"]
+        
+        # Decrypt Metadata
+        title = row["title"]
+        url = row["url"]
+        username = row["username"]
+        
+        if row["title_encrypted"]:
+            try:
+                title = decrypt_entry(
+                    row["title_encrypted"], row["title_nonce"], row["title_tag"],
+                    entry_key, associated_data=entry_id.encode("utf-8")
+                )
+            except Exception:
+                raise DatabaseError(f"CRITICAL: Title decryption failed for {entry_id}.")
+        
+        if row["url_encrypted"]:
+            try:
+                url = decrypt_entry(
+                    row["url_encrypted"], row["url_nonce"], row["url_tag"],
+                    entry_key, associated_data=entry_id.encode("utf-8")
+                )
+            except Exception:
+                raise DatabaseError(f"CRITICAL: URL decryption failed for {entry_id}.")
+
+        if row["username_encrypted"]:
+            try:
+                username = decrypt_entry(
+                    row["username_encrypted"], row["username_nonce"], row["username_tag"],
+                    entry_key, associated_data=entry_id.encode("utf-8")
+                )
+            except Exception:
+                raise DatabaseError(f"CRITICAL: Username decryption failed for {entry_id}.")
+
+        # Decrypt password field
+        password = ""
+        if row["password_encrypted"]:
             try:
                 password_data = decrypt_entry(
                     row["password_encrypted"],
@@ -439,11 +697,13 @@ class DatabaseManager:
                     associated_data=entry_id.encode("utf-8")
                 )
                 password_dict = json.loads(password_data)
-                password = password_dict.get("password")
+                password = password_dict.get("password", "")
             except Exception:
-                raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}. Data may be tampered or corrupt.")
+                raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}.")
                 
-            # Decrypt notes field
+        # Decrypt notes field
+        notes = ""
+        if row["notes_encrypted"]:
             try:
                 notes_data = decrypt_entry(
                     row["notes_encrypted"],
@@ -453,48 +713,37 @@ class DatabaseManager:
                     associated_data=entry_id.encode("utf-8")
                 )
                 notes_dict = json.loads(notes_data)
-                notes = notes_dict.get("notes")
+                notes = notes_dict.get("notes", "")
             except Exception:
                 raise DatabaseError(f"CRITICAL: Notes decryption failed for {entry_id}.")
-            
-            try:
-                modified_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                modified_date = datetime.fromisoformat(row["modified_at"])
+        
+        try:
+            modified_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            modified_date = datetime.fromisoformat(row["modified_at"])
 
-            # 🔑 NORMALIZE TIMEZONE (THIS IS THE FIX)
-            if modified_date.tzinfo is None:
-                modified_date = modified_date.replace(tzinfo=timezone.utc)
+        if modified_date.tzinfo is None:
+            modified_date = modified_date.replace(tzinfo=timezone.utc)
 
-            age_days = (datetime.now(timezone.utc) - modified_date).days
+        age_days = (datetime.now(timezone.utc) - modified_date).days
 
-            # Return combined dict
-            entry = {
-                "id": row["id"],
-                "title": row["title"],
-                "url": row["url"],
-                "username": row["username"],
-                "tags": row["tags"],
-                "category": row["category"],
-                "favorite": bool(row["favorite"]),          # <--- Return as bool
-                "password_strength": row["password_strength"], # <--- Return score
-                "password_age_days": age_days,
-                "created_at": row["created_at"],
-                "modified_at": row["modified_at"],
-                "last_accessed_at": row["last_accessed_at"],
-                "password": password,
-                "notes": notes,
-                "is_deleted": bool(row["is_deleted"])
-            }
-            
-            return entry
-            
-        except ValueError as e:
-            raise DatabaseError(f"Invalid input: {str(e)}")
-        except sqlite3.OperationalError as e:
-            raise DatabaseError(f"Database query failed: {str(e)}")
-        except Exception as e:
-            raise DatabaseError(f"Unexpected error retrieving entry: {str(e)}")
+        return {
+            "id": row["id"],
+            "title": title,
+            "url": url,
+            "username": username,
+            "tags": row["tags"],
+            "category": row["category"],
+            "favorite": bool(row["favorite"]),
+            "password_strength": row["password_strength"],
+            "password_age_days": age_days,
+            "created_at": row["created_at"],
+            "modified_at": row["modified_at"],
+            "last_accessed_at": row["last_accessed_at"],
+            "password": password,
+            "notes": notes,
+            "is_deleted": bool(row["is_deleted"])
+        }
 
     def update_entry(self, entry_id: str, vault_key: bytes, **kwargs) -> Tuple[bool, int]:
         conn = None
@@ -532,6 +781,22 @@ class DatabaseManager:
                     )
                     fields.extend(["password_encrypted = ?", "password_nonce = ?", "password_tag = ?"])
                     values.extend([ct, nonce, tag])
+
+                # Handle metadata re-encryption
+                for meta in ['title', 'url', 'username']:
+                    if meta in kwargs:
+                        val = kwargs[meta]
+                        if val is not None:
+                            ct, nonce, tag = encrypt_entry(
+                                val, entry_key, associated_data=entry_id.encode("utf-8")
+                            )
+                            fields.extend([f"{meta}_encrypted = ?", f"{meta}_nonce = ?", f"{meta}_tag = ?"])
+                            values.extend([ct, nonce, tag])
+                        else:
+                            fields.extend([f"{meta}_encrypted = NULL", f"{meta}_nonce = NULL", f"{meta}_tag = NULL"])
+                        
+                        # Nullify plaintext version
+                        fields.append(f"{meta} = NULL")
 
                 if 'notes' in kwargs:
                     nt_json = json.dumps({"notes": kwargs['notes'] or ""})
@@ -610,11 +875,12 @@ class DatabaseManager:
     def list_entries(
             self,
             include_deleted: bool = False,
+            only_deleted: bool = False,
             category=None,
             favorite=None,
             limit: int = 100,
-            last_timestamp: str = None,  # Keyset: last seen modified_at
-            last_id: str = None  # Keyset: tie-breaker id
+            last_timestamp: str = None,
+            last_id: str = None
     ) -> List[Dict]:
         try:
             conn = self.connect()
@@ -623,7 +889,9 @@ class DatabaseManager:
             conditions = []
             params = []
 
-            if not include_deleted:
+            if only_deleted:
+                conditions.append("is_deleted = 1")
+            elif not include_deleted:
                 conditions.append("is_deleted = 0")
             if category is not None:
                 conditions.append("category = ?")
@@ -730,17 +998,55 @@ class DatabaseManager:
             conn.rollback()
             raise DatabaseError(f"Failed to update metadata[{key}]: {e}") from e
         
+    def add_audit_log(
+        self, 
+        action_type: str, 
+        entry_id: Optional[str] = None, 
+        details: Optional[str] = None,
+        actor: str = 'system',
+        source: str = 'Internal',
+        severity: str = 'Info',
+        ip_address: str = '127.0.0.1'
+    ) -> None:
+        """
+        Record an event in the security audit log.
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log 
+                (entry_id, action_type, actor, source, severity, ip_address, details) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (entry_id, action_type, actor, source, severity, ip_address, details)
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise DatabaseError(f"Failed to add audit log: {e}")
+
     def get_audit_logs(self, limit: int = 50) -> List[Dict]:
         """
         Retrieve recent security audit logs.
-        Ordered by time (newest first) and ID (to handle same-second events).
         """
         conn = self.connect()
         cursor = conn.execute("""
-            SELECT a.id, a.entry_id, e.title, a.action_type, a.timestamp
+            SELECT 
+                a.id, 
+                a.entry_id, 
+                e.title as entry_title, 
+                a.action_type as event_type,
+                a.actor,
+                a.source,
+                a.severity,
+                a.ip_address,
+                a.details,
+                a.timestamp
             FROM audit_log a
             LEFT JOIN entries e ON a.entry_id = e.id
-            ORDER BY a.timestamp DESC, a.id DESC  -- <--- FIXED: Added secondary sort
+            ORDER BY a.timestamp DESC, a.id DESC
             LIMIT ?
         """, (limit,))
         
@@ -792,6 +1098,7 @@ class DatabaseManager:
 
     def search_entries(
             self,
+            vault_key: bytes,
             query: str,
             include_deleted: bool = False,
             limit: int = 50,
@@ -844,9 +1151,128 @@ class DatabaseManager:
                 params = [wildcard, wildcard, wildcard, wildcard, 1 if include_deleted else 0, limit, offset]
 
             cursor = conn.execute(sql, params)
-            return [dict(row) for row in cursor.fetchall()]
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Option A: Decrypt-on-search
+            final_results = []
+            
+            # For decrypt-on-search for title/url/username:
+            # We fetch all active entries (if not already matched by tags) and perform substring match.
+            sql_all = "SELECT * FROM entries WHERE (is_deleted = 0 OR ? = 1)"
+            all_rows = conn.execute(sql_all, (1 if include_deleted else 0,)).fetchall()
+            
+            query_lower = query.lower()
+            
+            for row in all_rows:
+                entry_id = row["id"]
+                entry_salt = row["kdf_salt"]
+                entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
+                
+                # Decrypt title
+                title = row["title"]
+                if row["title_encrypted"]:
+                    try:
+                        title = decrypt_entry(row["title_encrypted"], row["title_nonce"], row["title_tag"], entry_key, associated_data=entry_id.encode())
+                    except Exception: title = "[Decryption Failed]"
+                
+                # Decrypt URL
+                url = row["url"]
+                if row["url_encrypted"]:
+                    try:
+                        url = decrypt_entry(row["url_encrypted"], row["url_nonce"], row["url_tag"], entry_key, associated_data=entry_id.encode())
+                    except Exception: url = ""
+                
+                # Decrypt Username
+                username = row["username"]
+                if row["username_encrypted"]:
+                    try:
+                        username = decrypt_entry(row["username_encrypted"], row["username_nonce"], row["username_tag"], entry_key, associated_data=entry_id.encode())
+                    except Exception: username = ""
+                
+                tags = row["tags"] or ""
+                
+                # Perform substring match
+                if (query_lower in title.lower() or 
+                    (url and query_lower in url.lower()) or 
+                    (username and query_lower in username.lower()) or
+                    (tags and query_lower in tags.lower())):
+                    
+                    try:
+                        modified_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        modified_date = datetime.fromisoformat(row["modified_at"])
+                    if modified_date.tzinfo is None:
+                        modified_date = modified_date.replace(tzinfo=timezone.utc)
+                    age_days = (datetime.now(timezone.utc) - modified_date).days
+
+                    final_results.append({
+                        "id": row["id"],
+                        "title": title,
+                        "url": url,
+                        "username": username,
+                        "tags": tags,
+                        "category": row["category"],
+                        "favorite": bool(row["favorite"]),
+                        "password_strength": row["password_strength"],
+                        "created_at": row["created_at"],
+                        "modified_at": row["modified_at"],
+                        "age_days": age_days
+                    })
+            
+            # Sort by modified_at DESC
+            final_results.sort(key=lambda x: x["modified_at"], reverse=True)
+            
+            # Apply pagination
+            return final_results[offset : offset + limit]
         except Exception as e:
             raise DatabaseError(f"Failed to search entries: {e}")
+
+    def migrate_entries_metadata(self, vault_key: bytes) -> int:
+        """
+        Migrate plaintext 'title', 'url', 'username' to encrypted storage.
+        """
+        conn = self.connect()
+        cursor = conn.execute("SELECT * FROM entries WHERE title IS NOT NULL OR url IS NOT NULL OR username IS NOT NULL")
+        rows = cursor.fetchall()
+        
+        migrated_count = 0
+        for row in rows:
+            entry_id = row["id"]
+            entry_salt = row["kdf_salt"]
+            entry_key = self._derive_entry_key(vault_key, entry_id, entry_salt)
+            
+            updates = []
+            vals = []
+            
+            # Encrypt Title
+            if row["title"] and not row["title_encrypted"]:
+                ct, nonce, tag = encrypt_entry(row["title"], entry_key, associated_data=entry_id.encode())
+                updates.extend(["title_encrypted = ?", "title_nonce = ?", "title_tag = ?", "title = NULL"])
+                vals.extend([ct, nonce, tag])
+            
+            # Encrypt URL
+            if row["url"] and not row["url_encrypted"]:
+                ct, nonce, tag = encrypt_entry(row["url"], entry_key, associated_data=entry_id.encode())
+                updates.extend(["url_encrypted = ?", "url_nonce = ?", "url_tag = ?", "url = NULL"])
+                vals.extend([ct, nonce, tag])
+            
+            # Encrypt Username
+            if row["username"] and not row["username_encrypted"]:
+                ct, nonce, tag = encrypt_entry(row["username"], entry_key, associated_data=entry_id.encode())
+                updates.extend(["username_encrypted = ?", "username_nonce = ?", "username_tag = ?", "username = NULL"])
+                vals.extend([ct, nonce, tag])
+            
+            if updates:
+                sql = f"UPDATE entries SET {', '.join(updates)} WHERE id = ?"
+                vals.append(entry_id)
+                conn.execute(sql, tuple(vals))
+                migrated_count += 1
+        
+        if migrated_count > 0:
+            conn.commit()
+            self.add_audit_log(action_type="MIGRATE_METADATA", details=f"Migrated {migrated_count} entries to encrypted metadata (v2.1)")
+            
+        return migrated_count
 
     def list_entry_ids(self) -> List[str]:
         """
@@ -985,3 +1411,100 @@ class DatabaseManager:
         except Exception as e:
             if conn: conn.rollback()
             raise DatabaseError(f"Hard delete failed: {e}")
+    def empty_trash(self) -> int:
+        """
+        Permanently remove ALL entries marked as deleted.
+        Returns the number of entries removed.
+        """
+        conn = None
+        try:
+            conn = self.connect()
+            conn.execute("BEGIN IMMEDIATE")
+            
+            cursor = conn.execute("DELETE FROM entries WHERE is_deleted = 1")
+            count = cursor.rowcount
+            
+            conn.commit()
+            return count
+        except Exception as e:
+            if conn: conn.rollback()
+            raise DatabaseError(f"Empty trash failed: {e}")
+
+    def add_backup_history_entry(self, operation_type: str, filename: Optional[str] = None, 
+                                 file_size: Optional[int] = None, status: str = "Success", 
+                                 details: Optional[str] = None) -> None:
+        """
+        Record a maintenance operation in the backup history.
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT INTO backup_history (operation_type, filename, file_size, status, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (operation_type, filename, file_size, status, details))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise DatabaseError(f"Failed to add backup history entry: {e}")
+
+    def get_backup_history(self, limit: int = 50) -> List[Dict]:
+        """
+        Retrieve recent maintenance operation history.
+        """
+        conn = self.connect()
+        cursor = conn.execute("""
+            SELECT id, timestamp, operation_type, filename, file_size, status, details
+            FROM backup_history
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_metadata(self, key: str) -> Optional[Any]:
+        """
+        Retrieve a value from the metadata table.
+        """
+        conn = self.connect()
+        cursor = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        if row:
+            try:
+                return json.loads(row["value"])
+            except Exception:
+                return row["value"]
+        return None
+
+    def update_metadata(self, key: str, value: Any) -> bool:
+        """
+        Upsert a key/value pair into the metadata table.
+        """
+        conn = None
+        try:
+            conn = self.connect()
+            conn.execute("BEGIN IMMEDIATE;")
+            
+            # Serialize if not a string
+            if not isinstance(value, str):
+                val_str = json.dumps(value)
+            else:
+                # Try to see if it's already valid JSON
+                try:
+                    json.loads(value)
+                    val_str = value
+                except Exception:
+                    val_str = json.dumps(value)
+
+            conn.execute("""
+                INSERT INTO metadata (key, value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """, (key, val_str))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn: conn.rollback()
+            raise DatabaseError(f"Failed to update metadata: {e}")
