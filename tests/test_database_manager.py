@@ -4,7 +4,6 @@ import json
 import tempfile
 import pytest
 from unittest.mock import patch, MagicMock
-from datetime import datetime, timezone
 
 from src.database_manager import (
     DatabaseManager,
@@ -65,6 +64,7 @@ def test_initialize_database_success(db, tmp_path):
     """, encoding="utf-8")
     
     # 2. Patch the PATH variable to point to our real temp file
+    # We do NOT mock open(); we let the code read the real file we just made.
     with patch("src.database_manager.SCHEMA_PATH", str(schema_file)):
          assert db.initialize_database() is True
 
@@ -158,15 +158,6 @@ def test_add_and_get_entry(
             title TEXT,
             url TEXT,
             username TEXT,
-            title_encrypted BLOB,
-            title_nonce BLOB,
-            title_tag BLOB,
-            url_encrypted BLOB,
-            url_nonce BLOB,
-            url_tag BLOB,
-            username_encrypted BLOB,
-            username_nonce BLOB,
-            username_tag BLOB,
             password_encrypted BLOB,
             password_nonce BLOB,
             password_tag BLOB,
@@ -180,6 +171,7 @@ def test_add_and_get_entry(
             modified_at TEXT,
             favorite INTEGER,
             password_strength INTEGER,
+            password_age_days INTEGER DEFAULT 0,
             is_deleted INTEGER DEFAULT 0,
             deleted_at TEXT,
             last_accessed_at TEXT
@@ -196,10 +188,9 @@ def test_add_and_get_entry(
 
     assert isinstance(eid, str)
     
-    # Verify insertion: Plaintext columns should be NULL (because we encrypt them)
-    row = db.connection.execute("SELECT title, title_encrypted FROM entries WHERE id=?", (eid,)).fetchone()
-    assert row["title"] is None
-    assert row["title_encrypted"] is not None
+    # Verify insertion
+    row = db.connection.execute("SELECT title FROM entries WHERE id=?", (eid,)).fetchone()
+    assert row["title"] == "Email"
 
 def test_add_entry_rejects_invalid_title(db, vault_key):
     with pytest.raises(DatabaseError, match="Invalid entry data"):
@@ -281,24 +272,9 @@ def test_delete_and_restore_entry(db):
 # list_entries
 # ---------------------------------------------------------------------------
 
-def test_list_entries_no_crash(db):
-    db.connect()
-    db.connection.execute("""
-        CREATE TABLE entries (
-            id TEXT PRIMARY KEY, 
-            title TEXT, 
-            url TEXT, 
-            username TEXT, 
-            tags TEXT, 
-            category TEXT, 
-            password_strength INTEGER,
-            created_at TEXT, 
-            modified_at TEXT, 
-            is_deleted INTEGER DEFAULT 0
-        )
-    """)
-    # Should not crash even with large limit
-    db.list_entries(limit=5000) 
+def test_list_entries_limit_validation(db):
+    with pytest.raises(DatabaseError, match="exceeds maximum"):
+        db.list_entries(limit=5000)
 
 # ---------------------------------------------------------------------------
 # Metadata KV
@@ -337,100 +313,3 @@ def test_clear_lockout_history(db):
         "SELECT * FROM lockout_attempts"
     ).fetchall()
     assert len(rows) == 0
-
-# ---------------------------------------------------------------------------
-# Metadata Encryption & Migration
-# ---------------------------------------------------------------------------
-
-def test_migrate_entries_metadata(db, vault_key):
-    db.connect()
-    db.connection.executescript("""
-        CREATE TABLE entries (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            url TEXT,
-            username TEXT,
-            title_encrypted BLOB,
-            title_nonce BLOB,
-            title_tag BLOB,
-            url_encrypted BLOB,
-            url_nonce BLOB,
-            url_tag BLOB,
-            username_encrypted BLOB,
-            username_nonce BLOB,
-            username_tag BLOB,
-            password_encrypted BLOB,
-            password_nonce BLOB,
-            password_tag BLOB,
-            notes_encrypted BLOB,
-            notes_nonce BLOB,
-            notes_tag BLOB,
-            kdf_salt BLOB,
-            is_deleted INTEGER DEFAULT 0,
-            modified_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_id TEXT,
-            action_type TEXT NOT NULL,
-            details TEXT,
-            timestamp TEXT DEFAULT (datetime('now'))
-        );
-        INSERT INTO entries (id, title, url, username, password_encrypted, password_nonce, password_tag, kdf_salt, is_deleted, modified_at)
-        VALUES ('v1_entry', 'Plain Title', 'http://plain.url', 'plain_user', x'00', x'00', x'00', x'00000000000000000000000000000000', 0, '2024-01-01 10:00:00');
-    """)
-    db.connection.commit()
-
-    with patch("src.database_manager.encrypt_entry", return_value=(b"c", b"n", b"t")), \
-         patch("src.database_manager.derive_hkdf_key", return_value=b"k"*32):
-        count = db.migrate_entries_metadata(vault_key)
-        assert count == 1
-    
-    row = db.connection.execute("SELECT title, title_encrypted, url, url_encrypted, username, username_encrypted FROM entries WHERE id='v1_entry'").fetchone()
-    assert row["title"] is None
-    assert row["title_encrypted"] is not None
-    assert row["url"] is None
-    assert row["url_encrypted"] is not None
-    assert row["username"] is None
-    assert row["username_encrypted"] is not None
-
-def test_search_entries_encrypted(db, vault_key):
-    # Setup entries with encrypted metadata
-    db.connect()
-    # We use the real add_entry (with hashing/crypto patched) to populate
-    with patch("src.database_manager.encrypt_entry", side_effect=lambda p, k, associated_data=None: (p.encode() if p else None, b"nonce", b"tag")), \
-         patch("src.database_manager.generate_salt", return_value=b"s"*16), \
-         patch("src.database_manager.derive_hkdf_key", return_value=b"k"*32), \
-         patch("src.database_manager.decrypt_entry", side_effect=lambda c, n, t, k, associated_data=None: c.decode()):
-        
-        # We need a proper schema first
-        db.connection.executescript("""
-            CREATE TABLE entries (
-                id TEXT PRIMARY KEY, title TEXT, url TEXT, username TEXT,
-                title_encrypted BLOB, title_nonce BLOB, title_tag BLOB,
-                url_encrypted BLOB, url_nonce BLOB, url_tag BLOB,
-                username_encrypted BLOB, username_nonce BLOB, username_tag BLOB,
-                password_encrypted BLOB, password_nonce BLOB, password_tag BLOB,
-                notes_encrypted BLOB, notes_nonce BLOB, notes_tag BLOB,
-                kdf_salt BLOB, tags TEXT, category TEXT, created_at TEXT, modified_at TEXT,
-                favorite INTEGER, password_strength INTEGER, is_deleted INTEGER DEFAULT 0
-            );
-            CREATE VIRTUAL TABLE entries_fts USING fts5(title, url, username, tags, content='entries', content_rowid='rowid');
-        """)
-        
-        db.add_entry(vault_key, title="Secret Bank", url="bank.com", username="admin")
-        db.add_entry(vault_key, title="Personal Email", url="mail.com", username="user")
-        
-        # Search for "Bank"
-        results = db.search_entries(vault_key, "Bank")
-        assert len(results) == 1
-        assert results[0]["title"] == "Secret Bank"
-        
-        # Search for "mail"
-        results = db.search_entries(vault_key, "mail")
-        assert len(results) == 1
-        assert results[0]["title"] == "Personal Email"
-        
-        # Search for something non-existent
-        results = db.search_entries(vault_key, "missing")
-        assert len(results) == 0

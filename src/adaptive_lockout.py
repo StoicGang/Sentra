@@ -11,10 +11,10 @@ from typing import Dict, Any, Optional, Tuple
 
 class AdaptiveLockout:
 
-    DEFAULT_MAX_DELAY = 300              # seconds (soft backoff cap)
-    DEFAULT_HISTORY_WINDOW = 1800         # seconds (30 min sliding window)
-    DEFAULT_TRIM_LIMIT = 100              # max rows kept
-    DEFAULT_HARD_LOCKOUT_THRESHOLD = 10   # failures before hard lockout
+    DEFAULT_MAX_DELAY = 300 # seconds (soft backoff cap)
+    DEFAULT_HISTORY_WINDOW = 1800 # seconds (30 min sliding window)
+    DEFAULT_TRIM_LIMIT = 100 # max rows kept
+    DEFAULT_HARD_LOCKOUT_THRESHOLD = 10 # failures before hard lockout
     DEFAULT_HARD_LOCKOUT_DURATION = 86400 # seconds (24 hours)
 
     def __init__(self, dbmanager: DatabaseManager, config: Dict[str, Any]):
@@ -24,11 +24,11 @@ class AdaptiveLockout:
         Args:
             dbmanager: Instance of DatabaseManager for metadata access
             config: Config dictionary. Supports keys:
-                max_lockout_delay      — soft-backoff cap in seconds (default 300)
+                max_lockout_delay — soft-backoff cap in seconds (default 300)
                 history_window_seconds — sliding window length (default 1800)
-                history_trim_limit     — max DB rows kept (default 100)
+                history_trim_limit — max DB rows kept (default 100)
                 hard_lockout_threshold — failures before hard lockout (default 10)
-                hard_lockout_duration  — hard lockout duration in seconds (default 86400)
+                hard_lockout_duration — hard lockout duration in seconds (default 86400)
         """
         self.dbmanager = dbmanager
         self.config = dict(config) if config is not None else {}
@@ -82,9 +82,9 @@ class AdaptiveLockout:
         """
         Determine whether a new unlock attempt is allowed.
 
-        Hard lockout:  >= hard_lockout_threshold failures in history window
-                       → blocked for hard_lockout_duration seconds from last failure.
-        Soft backoff:  < threshold failures → exponential delay (1s, 2s, 4s … max_delay).
+        Hard lockout: >= hard_lockout_threshold failures in history window
+            → blocked for hard_lockout_duration seconds from last failure.
+        Soft backoff: < threshold failures → exponential delay (1s, 2s, 4s … max_delay).
 
         Returns:
             (allowed: bool, remaining_seconds: int)
@@ -131,11 +131,11 @@ class AdaptiveLockout:
         Return a rich status dict for CLI display and monitoring.
 
         Keys:
-            allowed          — bool: can an attempt be made right now?
-            delay_seconds    — int: seconds to wait (0 if allowed)
-            failures         — int: number of failures in the history window
-            hard_locked      — bool: True when >= hard_lockout_threshold failures
-            next_allowed_at  — Optional[str]: ISO-8601 UTC timestamp when lockout lifts
+            allowed — bool: can an attempt be made right now?
+            delay_seconds — int: seconds to wait (0 if allowed)
+            failures — int: number of failures in the history window
+            hard_locked — bool: True when >= hard_lockout_threshold failures
+            next_allowed_at — Optional[str]: ISO-8601 UTC timestamp when lockout lifts
             attempts_before_hard_lockout — int: remaining soft attempts before hard lockout
         """
         now = int(time.time())

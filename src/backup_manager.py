@@ -21,14 +21,14 @@ MAX_HEADER_LEN = 10 * 1024
 # Backup format versions
 # ---------------------------------------------------------------------------
 # v1 (legacy): header_len | header_JSON | payload_JSON | HMAC(32)
-#   - Each entry is individually encrypted inside the JSON payload.
-#   - The outer payload JSON is written in plaintext.
+# - Each entry is individually encrypted inside the JSON payload.
+# - The outer payload JSON is written in plaintext.
 #
 # v2 (current): header_len | header_JSON | enc_payload_len | enc_payload | HMAC(32)
-#   - A file-level ChaCha20-Poly1305 key is derived from enc_key via HKDF.
-#   - The entire entries-JSON payload is encrypted before writing.
-#   - The HMAC covers: header_len || header || enc_payload_len || enc_payload.
-#   - KDF salt (16 B) and file nonce (12 B) are stored in the header JSON.
+# - A file-level ChaCha20-Poly1305 key is derived from enc_key via HKDF.
+# - The entire entries-JSON payload is encrypted before writing.
+# - The HMAC covers: header_len || header || enc_payload_len || enc_payload.
+# - KDF salt (16 B) and file nonce (12 B) are stored in the header JSON.
 # ---------------------------------------------------------------------------
 
 BACKUP_VERSION = 2
@@ -246,11 +246,11 @@ class BackupManager:
                 if isinstance(k2, bytearray):
                     for i in range(len(k2)):
                         k2[i] = 0
-            try:
-                del enc_key
-                del hmac_key
-            except UnboundLocalError:
-                pass
+                try:
+                    del enc_key
+                    del hmac_key
+                except UnboundLocalError:
+                    pass
 
     # ------------------------------------------------------------------
     # restore_backup
@@ -313,10 +313,6 @@ class BackupManager:
         # ----------------------------------------------------------
         # 3. Split body and HMAC; verify integrity
         # ----------------------------------------------------------
-        # In v1: body = header_len | header | payload_JSON
-        #         file = body | HMAC(32)
-        # In v2: body = header_len | header | enc_payload_len | enc_payload
-        #         file = body | HMAC(32)
         hmac_stored = raw[-32:]
         body_bytes = raw[:-32]  # everything except the trailing HMAC
 
@@ -395,8 +391,6 @@ class BackupManager:
                 if not c_b64 or not n_b64 or not t_b64:
                     continue
 
-                # The entry_id is stored in plaintext so we can derive the
-                # same per-entry HKDF key that was used during create_backup.
                 stored_entry_id = item.get("entry_id")
                 if not stored_entry_id:
                     continue
@@ -469,6 +463,3 @@ class BackupManager:
         except Exception as e:
             conn.rollback()
             raise RuntimeError(f"Database write failed: {e}")
-
-        # Outer exception handler
-        # (RuntimeError from the inner try already propagates; this is for unexpected errors)

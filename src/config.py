@@ -28,3 +28,24 @@ SCHEMA_PATH = os.getenv("SENTRA_SCHEMA_PATH", str(DEFAULT_SCHEMA_PATH))
 # Ensure data directory exists if we are using the default path
 if str(DEFAULT_DATA_DIR) in DB_PATH:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# ============================================================
+# Security & UX Constants — single source of truth
+# Import these everywhere instead of redefining locally.
+# ============================================================
+
+# Password policy
+MIN_PASSWORD_LENGTH: int = int(os.getenv("SENTRA_MIN_PASSWORD_LENGTH", "12"))
+DEFAULT_PASSWORD_LENGTH: int = int(os.getenv("SENTRA_DEFAULT_PASSWORD_LENGTH", "16"))
+MAX_PASSWORD_LENGTH: int = 128
+
+# Auth / lockout
+MAX_LOGIN_ATTEMPTS: int = 3
+MAX_UNLOCK_ATTEMPTS: int = 10
+
+# Secure display
+REVEAL_DURATION_SECS: int = int(os.getenv("SENTRA_REVEAL_DURATION", "10"))
+CLIPBOARD_CLEAR_SECS: int = int(os.getenv("SENTRA_CLIPBOARD_CLEAR", "30"))
+
+# Input sanitization
+MAX_INPUT_LENGTH: int = 1000

@@ -809,7 +809,8 @@ class VaultController:
         favorite: bool = False,
         notes: Optional[str] = None,
         tags: Optional[str] = None,
-        category: str = "General"
+        category: str = "General",
+        totp_secret: Optional[str] = None
     ) -> str:
         self._check_unlocked()  # Raise if locked
 
@@ -831,6 +832,7 @@ class VaultController:
                 notes=notes,
                 tags=tags,
                 category=category,
+                totp_secret=totp_secret,
                 favorite=favorite,             # <--- Pass to DB
                 password_strength=strength_score # <--- Pass to DB
             )        
@@ -951,7 +953,8 @@ class VaultController:
         """
         self._check_unlocked()
         try:
-            return self.db.list_entries(
+            vault_key = bytes(self.vault_key_secure)
+            rows = self.db.list_entries(
                 include_deleted=include_deleted,
                 only_deleted=only_deleted,
                 category=category,
@@ -960,6 +963,20 @@ class VaultController:
                 last_timestamp=last_timestamp,
                 last_id=last_id
             )
+            for row in rows:
+                if row.get('title_encrypted') and row.get('kdf_salt'):
+                    try:
+                        entry_key = self.db._derive_entry_key(
+                            vault_key, row['id'], row['kdf_salt']
+                        )
+                        row['title'] = _de(
+                            row['title_encrypted'], row['title_nonce'],
+                            row['title_tag'], entry_key,
+                            associated_data=row['id'].encode('utf-8')
+                        )
+                    except Exception:
+                        pass
+            return rows
         except Exception as e:
             raise VaultError(f"Failed to list entries: {e}")
 

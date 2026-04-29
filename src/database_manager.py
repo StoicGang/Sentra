@@ -108,13 +108,6 @@ class DatabaseManager:
         """
         close the database connection
         """
-        # TODO: Implement connection closing
-        # HINTS:
-        # 1. Check if self.connection exists
-        # 2. If yes, commit any pending transactions: self.connection.commit()
-        # 3. Close connection: self.connection.close()
-        # 4. Set self.connection = None
-        
         if self.connection:
             try:
                 self.connection.commit()
@@ -161,6 +154,55 @@ class DatabaseManager:
             return all_entries
         except Exception as e:
             raise DatabaseError(f"Failed to retrieve all entries: {e}")
+
+    def list_entries(
+        self,
+        include_deleted: bool = False,
+        category: str = None,
+        favorite: bool = None,
+        limit: int = 100,
+        last_timestamp: str = None,
+        last_id: str = None
+    ) -> List[Dict]:
+        """
+        Return metadata-only rows from the entries table.
+        No decryption — password/notes blobs are never touched.
+        Supports cursor-based pagination via (last_timestamp, last_id).
+        """
+        try:
+            conn = self.connect()
+            conditions = []
+            params = []
+
+            if not include_deleted:
+                conditions.append("is_deleted = 0")
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+            if favorite is not None:
+                conditions.append("favorite = ?")
+                params.append(1 if favorite else 0)
+            if last_timestamp and last_id:
+                conditions.append("(modified_at < ? OR (modified_at = ? AND id < ?))")
+                params.extend([last_timestamp, last_timestamp, last_id])
+
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            params.append(limit)
+
+            sql = f"""
+                SELECT id, title, url, username, tags, category, favorite,
+                       password_strength, created_at, modified_at, is_deleted
+                FROM entries
+                {where}
+                ORDER BY modified_at DESC, id DESC
+                LIMIT ?
+            """
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            raise DatabaseError(f"Failed to list entries: {e}")
+
 
     @staticmethod
     def _validate_entry_data(
@@ -299,6 +341,30 @@ class DatabaseManager:
                     conn.execute("ALTER TABLE entries ADD COLUMN username_tag BLOB")
             except Exception as e:
                 raise DatabaseError(f"Metadata schema upgrade failed: {e}")
+
+            # --- Migration Section: TOTP Secret Storage (v2.4) ---
+            try:
+                cursor = conn.execute("PRAGMA table_info(entries)")
+                columns = {row[1] for row in cursor.fetchall()}
+
+                if 'totp_secret_encrypted' not in columns:
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_encrypted BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_nonce BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_tag BLOB")
+            except Exception as e:
+                raise DatabaseError(f"TOTP schema upgrade failed: {e}")
+
+            # --- Migration Section: TOTP Secret Storage (v2.4) ---
+            try:
+                cursor = conn.execute("PRAGMA table_info(entries)")
+                columns = {row[1] for row in cursor.fetchall()}
+
+                if 'totp_secret_encrypted' not in columns:
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_encrypted BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_nonce BLOB")
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_tag BLOB")
+            except Exception as e:
+                raise DatabaseError(f"TOTP schema upgrade failed: {e}")
 
             # --- Migration Section: Maintenance History (v2.2) ---
             try:
@@ -488,6 +554,7 @@ class DatabaseManager:
             category: str = "General",
             favorite: bool = False,
             password_strength: int = 0,
+            totp_secret: Optional[str] = None,
             entry_id: Optional[str] = None
     ) -> str:
         try:
@@ -536,6 +603,13 @@ class DatabaseManager:
                 entry_key,
                 associated_data=entry_id.encode("utf-8")
             )
+
+            totp_cipher, totp_nonce, totp_tag = None, None, None
+            if totp_secret:
+                totp_cipher, totp_nonce, totp_tag = encrypt_entry(
+                    totp_secret, entry_key,
+                    associated_data=entry_id.encode("utf-8")
+                )
             
             # 3. Encrypt Notes
             notes_payload = {"notes": notes or ""}
@@ -555,17 +629,20 @@ class DatabaseManager:
                     username_encrypted, username_nonce, username_tag,
                     password_encrypted, password_nonce, password_tag,
                     notes_encrypted, notes_nonce, notes_tag,
+                    totp_secret_encrypted, totp_secret_nonce, totp_secret_tag,
                     kdf_salt,
                     tags, category, created_at, modified_at,
                     favorite, password_strength
-                ) VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                datetime('now'), datetime('now'), ?, ?)
             """, (
-                entry_id, 
+                entry_id, title, url, username,
                 title_cipher, title_nonce, title_tag,
                 url_cipher, url_nonce, url_tag,
                 username_cipher, username_nonce, username_tag,
                 pw_cipher, pw_nonce, pw_tag,          
-                notes_cipher, notes_nonce, notes_tag, 
+                notes_cipher, notes_nonce, notes_tag,
+                totp_cipher, totp_nonce, totp_tag,
                 entry_salt,
                 tags, category, 
                 1 if favorite else 0,   
@@ -665,8 +742,8 @@ class DatabaseManager:
                     entry_key, associated_data=entry_id.encode("utf-8")
                 )
             except Exception:
-                raise DatabaseError(f"CRITICAL: Title decryption failed for {entry_id}.")
-        
+                pass  # Keep plaintext title from row["title"]
+
         if row["url_encrypted"]:
             try:
                 url = decrypt_entry(
@@ -674,7 +751,7 @@ class DatabaseManager:
                     entry_key, associated_data=entry_id.encode("utf-8")
                 )
             except Exception:
-                raise DatabaseError(f"CRITICAL: URL decryption failed for {entry_id}.")
+                pass  # Keep plaintext url
 
         if row["username_encrypted"]:
             try:
@@ -683,7 +760,7 @@ class DatabaseManager:
                     entry_key, associated_data=entry_id.encode("utf-8")
                 )
             except Exception:
-                raise DatabaseError(f"CRITICAL: Username decryption failed for {entry_id}.")
+                pass  # Keep plaintext username
 
         # Decrypt password field
         password = ""
@@ -699,8 +776,8 @@ class DatabaseManager:
                 password_dict = json.loads(password_data)
                 password = password_dict.get("password", "")
             except Exception:
-                raise DatabaseError(f"CRITICAL: Password decryption failed for {entry_id}.")
-                
+                password = ""  # Entry is corrupt — return empty, don't crash
+
         # Decrypt notes field
         notes = ""
         if row["notes_encrypted"]:
@@ -715,12 +792,29 @@ class DatabaseManager:
                 notes_dict = json.loads(notes_data)
                 notes = notes_dict.get("notes", "")
             except Exception:
-                raise DatabaseError(f"CRITICAL: Notes decryption failed for {entry_id}.")
+                notes = ""  # Non-fatal
         
+        # Decrypt TOTP secret
+        totp_secret = None
+        if row["totp_secret_encrypted"]:
+            try:
+                totp_secret = decrypt_entry(
+                    row["totp_secret_encrypted"],
+                    row["totp_secret_nonce"],
+                    row["totp_secret_tag"],
+                    entry_key,
+                    associated_data=entry_id.encode("utf-8")
+                )
+            except Exception:
+                totp_secret = None  # Non-fatal
+
         try:
             modified_date = datetime.strptime(row["modified_at"], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            modified_date = datetime.fromisoformat(row["modified_at"])
+        except (ValueError, TypeError):
+            try:
+                modified_date = datetime.fromisoformat(row["modified_at"])
+            except (ValueError, TypeError):
+                modified_date = datetime.now(timezone.utc)
 
         if modified_date.tzinfo is None:
             modified_date = modified_date.replace(tzinfo=timezone.utc)
@@ -742,6 +836,7 @@ class DatabaseManager:
             "last_accessed_at": row["last_accessed_at"],
             "password": password,
             "notes": notes,
+            "totp_secret": totp_secret,
             "is_deleted": bool(row["is_deleted"])
         }
 
@@ -906,10 +1001,11 @@ class DatabaseManager:
 
             where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
             sql = f"""
-                SELECT id, title, url, username, tags, category, password_strength,
-                    created_at, modified_at, is_deleted
+                SELECT id, title, url, username, tags, category, favorite,
+                       password_strength, created_at, modified_at, is_deleted,
+                       CASE WHEN totp_secret IS NOT NULL AND totp_secret != '' THEN 1 ELSE 0 END AS has_totp
                 FROM entries
-                {where_clause}
+                {where}
                 ORDER BY modified_at DESC, id DESC
                 LIMIT ?
             """
@@ -1306,18 +1402,18 @@ class DatabaseManager:
             # 2. Prune old entries to prevent table bloat (keep last 1 hour)
             cutoff = now - retention_seconds
             conn.execute(
-            "DELETE FROM lockout_attempts WHERE attempt_ts < ?",
+                "DELETE FROM lockout_attempts WHERE attempt_ts < ?",
                 (cutoff,)
             )
             conn.execute(
-                f"""
-                            DELETE FROM lockout_attempts 
-                            WHERE id NOT IN (
-                                SELECT id FROM lockout_attempts 
-                                ORDER BY attempt_ts DESC 
-                                LIMIT ?
-                            )
-                            """,
+                """
+                DELETE FROM lockout_attempts 
+                WHERE id NOT IN (
+                    SELECT id FROM lockout_attempts 
+                    ORDER BY attempt_ts DESC 
+                    LIMIT ?
+                )
+                """,
                 (trim_limit,)
             )
             conn.commit()

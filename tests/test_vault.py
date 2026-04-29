@@ -210,7 +210,6 @@ def test_lock_vault_zeroizes_and_resets(controller, mock_secure_mem):
 def test_add_password_calculates_strength(controller, mock_db, mock_pw_gen):
     """Ensure add_password calls strength calculator and passes result to DB."""
     controller.is_unlocked = True
-    controller.master_key_secure = bytearray(b"m"*32)
     controller.vault_key_secure = bytearray(b"v"*32)
     mock_pw_gen.calculate_strength.return_value = (85, "Strong", {})
 
@@ -227,7 +226,6 @@ def test_add_password_calculates_strength(controller, mock_db, mock_pw_gen):
 def test_update_entry_recalculates_strength(controller, mock_db, mock_pw_gen):
     """Ensure update_entry recalculates strength if password changes."""
     controller.is_unlocked = True
-    controller.master_key_secure = bytearray(b"m"*32)
     controller.vault_key_secure = bytearray(b"v"*32)
     mock_pw_gen.calculate_strength.return_value = (40, "Weak", {})
 
@@ -241,8 +239,6 @@ def test_update_entry_recalculates_strength(controller, mock_db, mock_pw_gen):
 
 def test_search_entries_delegates_to_db(controller, mock_db):
     controller.is_unlocked = True
-    controller.master_key_secure = bytearray(b"m"*32)
-    controller.vault_key_secure = bytearray(b"v"*32)
     controller.search_entries("query")
     mock_db.search_entries.assert_called_with("query", False, 50, 0)
 

@@ -79,6 +79,15 @@ class TOTPGenerator:
         current_time = int(time.time())
         return time_step - (current_time % time_step)
 
+    def generate(self, secret: str, time_step: int = 30) -> tuple:
+        """
+        Convenience method for CLI use.
+        Returns (code, remaining) tuple.
+        """
+        code = self.generate_totp(secret, time_step)
+        remaining = self.get_time_remaining(time_step)
+        return code, remaining
+
     def is_valid_totp(
         self,
         entry_id: str,
