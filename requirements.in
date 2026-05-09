@@ -1,0 +1,20 @@
+# Security & Crypto
+cryptography
+argon2-cffi
+
+# Web & API
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# CLI & Utilities
+click
+rich
+tabulate
+colorama
+pyperclip
+
+# Database
+sqlite-utils
+pyotp

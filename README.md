@@ -91,6 +91,19 @@ pytest -q
 
 - Tests live in the `tests/` directory and cover crypto, storage, CLI flows, and utilities.
 
+## Supply Chain Security
+
+Sentra implements strict dependency locking and generates a Software Bill of Materials (SBOM) for compliance and integrity.
+
+- **Updating Dependencies**: We use `pip-tools`. To add or update a package, edit `requirements.in` and run:
+  ```bash
+  pip-compile --generate-hashes requirements.in
+  ```
+- **Generating SBOM**: To regenerate the Electronic SBOM (`bom.json`) after dependency changes, run:
+  ```bash
+  cyclonedx-py requirements requirements.txt -o bom.json
+  ```
+
 ## Security notes
 
 - The project stores secrets locally in an encrypted vault. Choose a strong master password — it cannot be recovered if lost.
