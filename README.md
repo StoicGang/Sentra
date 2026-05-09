@@ -1,40 +1,36 @@
 # Sentra
 
-A secure, local-first password manager with a modular CLI and per-entry encryption. Sentra stores all secrets in a local SQLite vault protected by Argon2id key derivation and ChaCha20-Poly1305 authenticated encryption. No cloud, no telemetry — your data stays on your machine.
+A local-first password manager with a modular CLI. Sentra stores secrets in a local SQLite database protected by Argon2id key derivation and ChaCha20-Poly1305 authenticated encryption. Designed with a focus on local operation, cryptographic standards, and audibility.
 
 ## Features
 
-- **Encrypted vault** — Argon2id master key derivation, ChaCha20-Poly1305 AEAD encryption, per-entry HKDF key isolation
-- **Interactive CLI shell** — Drop into an interactive session or run one-off commands
-- **Password generation** — Cryptographically secure generator with strength scoring, dictionary checks, and keyboard pattern detection
-- **TOTP support** — Generate and manage time-based one-time passwords
-- **Multi-vault management** — Create, switch between, and manage multiple independent vaults
-- **Encrypted backup & restore** — HMAC-verified, versioned backup format (v2) with per-backup derived keys
-- **Account recovery** — Passphrase-based or one-time recovery codes to regain access if the master password is forgotten
-- **Adaptive brute-force protection** — Exponential backoff with a hard lockout after repeated failures
-- **Secure memory handling** — OS-level memory locking (`VirtualLock`/`mlock`) with verified zeroization and fork protection
-- **Timed secret display** — Passwords shown for a limited duration, then erased from the terminal
-- **Clipboard auto-clear** — Copied secrets are wiped from the clipboard after a configurable timeout
-- **Soft delete & restore** — Deleted entries go to trash before permanent removal
-- **Audit logging** — All vault operations (unlock, create, update, delete, security events) are logged
-- **Self-destruct** — Configurable auto-destruct after N failed attempts, or manual trigger
-- **Full-text search** — FTS5-powered search across entry titles, URLs, usernames, and tags
-- **Supply chain security** — Locked dependencies with SHA-256 hashes and CycloneDX SBOM
+- **Encrypted Secrets** — Passwords and notes are protected by ChaCha20-Poly1305 AEAD encryption with per-entry HKDF key isolation. *(Note: Titles, URLs, and Usernames remain plaintext for searchability).*
+- **Interactive CLI shell** — Drop into an interactive session or run one-off commands.
+- **Password Generation** — Generator with strength scoring, dictionary checks, and keyboard pattern detection.
+- **TOTP Support** — Generate and manage time-based one-time passwords.
+- **Multi-Vault Management** — Create, switch between, and manage multiple independent vaults.
+- **Encrypted Backup & Restore** — HMAC-verified, versioned backups encrypted with keys derived from the master key.
+- **Account Recovery** — Passphrase-based or one-time recovery codes to regain access if the master password is lost.
+- **Interactive Rate Limiting** — Application-level exponential backoff prevents rapid manual password guessing at the CLI.
+- **Best-Effort Key Memory Protection** — Uses OS-level memory locking (`VirtualLock`/`mlock`) to protect active master key buffers from swapping to disk.
+- **Timed Secret Display** — Visually hides passwords from the terminal screen after a duration, and auto-clears standard OS clipboards.
+- **Vault Deletion** — Configurable trigger to delete the database file after N failed interactive attempts.
+- **Soft Delete & Restore** — Deleted entries go to trash before permanent removal.
+- **Audit Logging** — Vault operations (unlock, create, update, delete) are logged internally.
+- **Full-Text Search** — FTS5-powered search across unencrypted entry metadata.
+- **Supply Chain Security** — Locked dependencies with SHA-256 hashes and CycloneDX SBOM.
 
-## Tech Stack
+## Threat Model & Limitations
 
-| Component | Technology |
-|---|---|
-| Language | Python 3.8+ |
-| Encryption | `cryptography` (ChaCha20-Poly1305, HKDF-SHA256) |
-| Key Derivation | `argon2-cffi` (Argon2id), PBKDF2-HMAC-SHA256 |
-| Database | SQLite (WAL mode, FTS5) via `sqlite-utils` |
-| CLI Framework | `argparse` + interactive shell |
-| TOTP | `pyotp` |
-| Clipboard | `pyperclip` |
-| Output | `rich`, `colorama`, `tabulate` |
-| Dependency Lock | `pip-tools` (hashed requirements) |
-| SBOM | CycloneDX |
+Sentra is designed to protect your secrets at rest against offline extraction, assuming the attacker does not have your master password. However, it is critical to understand its limitations to make informed security decisions:
+
+- **Plaintext Metadata:** To enable fast full-text searching (via SQLite FTS5), entry Titles, URLs, Usernames, and Tags are stored in **plaintext**. An attacker with access to your `vault.db` file can see which services you use, even without the master password.
+- **Offline Brute-Force:** The interactive lockout feature only protects against manual guessing at the CLI. If an attacker copies your `vault.db` file to their own machine, the lockout is bypassed. Your defense against offline attacks relies entirely on the strength of your Master Password against Argon2id.
+- **Malware & Keyloggers:** Sentra runs in user-space. It does not protect against OS-level keyloggers, screen scrapers, or advanced malware that can dump Python process memory.
+- **Memory Protection Limits:** While Sentra makes a best-effort attempt to lock the master key buffer in memory, Python is a managed language. Immutable byte strings and individual passwords may still reside in standard memory and be subject to garbage collection unpredictability.
+- **Clipboard & Terminal History:** The clipboard auto-clear feature sends an empty string, but this may not erase secrets from OS-level clipboard managers (like Windows Clipboard History `Win+V` or macOS clipboard managers). Terminal erasure may also not clear scrollback buffers depending on your terminal emulator.
+- **Vault Deletion Forensics:** The auto-destruct feature performs a standard file deletion (`os.remove`). It does not securely overwrite disk sectors. Due to wear-leveling on modern SSDs, deleted databases may be highly recoverable via forensic tools.
+- **CSV Exports:** Using the export feature produces an absolute plaintext CSV file. Ensure this file is used only temporarily and is not synced to insecure cloud storage.
 
 ## Installation
 
@@ -78,8 +74,6 @@ SENTRA_SCHEMA_PATH=data/schema.sql
 
 ### Environment Variables
 
-All settings have sensible defaults. Override via `.env` or shell environment:
-
 | Variable | Default | Description |
 |---|---|---|
 | `SENTRA_DB_PATH` | `data/vault.db` | Path to the vault database |
@@ -122,7 +116,7 @@ python main.py <command> [options]
 | `totp` | Show TOTP code (`-s` secret, `-w` watch mode) |
 | `backup` | Create an encrypted backup (`-o` output path) |
 | `import` | Restore from a backup file (`-i` input path) |
-| `export` | Export entries to CSV (`-o` output path) |
+| `export` | Export entries to CSV (Warning: Plaintext) |
 | `vaults` | Manage vaults (list, create, remove, switch) |
 | `switch` | Switch active vault |
 | `recovery` | Manage recovery options (status, change, disable) |
@@ -130,37 +124,9 @@ python main.py <command> [options]
 | `status` | Show vault status and metadata |
 | `audit` | View audit log (`-l` limit) |
 | `security` | Run a security health check |
-| `self-destruct` | Configure or trigger vault self-destruct |
+| `self-destruct` | Configure or trigger vault deletion |
 | `copy` | Copy last viewed password or TOTP code |
 | `config` | Application settings (`--clipboard-timeout`) |
-
-### Examples
-
-```bash
-# First run — creates a new vault interactively
-python main.py login
-
-# Add an entry with auto-generated password
-python main.py add -t "GitHub" -u "user@example.com" -g -l 24
-
-# View entry with timed reveal (clears after 10s)
-python main.py get -t "GitHub" -s
-
-# Copy password to clipboard (auto-clears after 30s)
-python main.py get -t "GitHub" -c
-
-# Generate a standalone password
-python main.py genpass -l 20 -c
-
-# Create an encrypted backup
-python main.py backup -o vault_backup.enc
-
-# Search entries
-python main.py search "github"
-
-# View security audit log
-python main.py audit -l 20
-```
 
 ## Development
 
@@ -172,25 +138,7 @@ pytest
 
 # Run with coverage report
 pytest --cov=src --cov=cli --cov-report=html
-
-# Run a specific test file
-pytest tests/test_crypto.py -v
 ```
-
-### Test Coverage
-
-The test suite covers:
-
-- Cryptographic operations (encryption, decryption, key derivation, HMAC)
-- Vault lifecycle (create, unlock, lock, state machine)
-- Password generation and strength scoring
-- Backup creation and restoration
-- Recovery manager (passphrase and code-based)
-- Secure memory (locking, zeroization)
-- Secure display (timed reveal, clipboard)
-- Adaptive lockout (exponential backoff, hard lockout)
-- Self-destruct mechanism
-- CLI commands and argument parsing
 
 ## Supply Chain Security
 
@@ -205,13 +153,12 @@ Sentra uses strict dependency locking and generates a Software Bill of Materials
   cyclonedx-py requirements requirements.txt -o bom.json
   ```
 
-## Security Notes
+## Security Notes & Backups
 
-- The vault is stored locally in an encrypted SQLite database. **If you lose your master password and have no recovery credentials configured, your data cannot be recovered.**
-- Secrets are handled with care: OS-level memory locking prevents swap-to-disk, keys are zeroized on lock, and clipboard contents are auto-cleared.
-- Argon2id parameters are tuned for a ~2 second unlock time on modern hardware.
-- Each entry uses a unique HKDF-derived key (per-entry salt), so compromising one entry does not expose others.
-- Run Sentra only on a trusted machine. Do not share vault exports unless encrypted and transferred securely.
+- **Backup Encryption:** The backup encryption key is derived directly from the live vault's master encryption key. Backups do not use a separate password. If you lose your master password (and have no recovery codes), you also permanently lose the ability to decrypt your backups.
+- **Key Derivation:** Argon2id parameters are tuned to provide offline brute-force resistance while aiming for a ~2 second unlock time on modern hardware.
+- **Entry Isolation:** Each encrypted entry uses a unique HKDF-derived key (per-entry salt).
+- **Environment Context:** Run Sentra only on a trusted machine. Do not share vault exports unless encrypted and transferred securely.
 
 ## Contributing
 
