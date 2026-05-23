@@ -1,20 +1,37 @@
-# Security & Crypto
-cryptography
-argon2-cffi
+# ============================================================
+# Sentra Dependencies — requirements.in
+# Approved per: P2P_SYNC_SECURITY_AUTOMATION_AND_COMPLIANCE.md §4
+# Pin policy: All deps pinned to hash in requirements.txt
+# Update policy: Monthly CVE scan, major bumps require Security Review
+# ============================================================
 
-# Web & API
+# --- Security & Crypto (APPROVED: Guardrails §4) ---
+cryptography          # ChaCha20-Poly1305, HKDF-SHA256, Ed25519, X25519
+argon2-cffi           # Argon2id KDF (m=64MB, t=3, p=4)
+
+# --- P2P Transport (APPROVED: Guardrails §4, Bootstrap §7) ---
+noiseprotocol         # Noise_IK handshake (25519, ChaChaPoly, SHA256)
+
+# --- Web & API ---
 fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
 
-# CLI & Utilities
+# --- CLI & Utilities ---
 click
 rich
 tabulate
 colorama
 pyperclip
 
-# Database
+# --- Database ---
 sqlite-utils
 pyotp
+
+# --- Testing (dev-only, not shipped) ---
+# pytest
+# pytest-cov
+# bandit
+# semgrep
+# atheris               # Fuzzing (per Security Automation §8)
