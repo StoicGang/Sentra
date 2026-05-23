@@ -60,93 +60,94 @@ def check(label: str, args: list[str], *, must_contain: str = None,
         results.append((FAIL, label, str(e), ""))
 
 
-# ── No-auth commands ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # ── No-auth commands ──────────────────────────────────────────────────────────
 
-check("--help",
-      ["--help"],
-      must_contain="Sentra - Secure Password Manager")
+    check("--help",
+          ["--help"],
+          must_contain="Sentra - Secure Password Manager")
 
-check("--version",
-      ["--version"],
-      must_contain="")  # just no crash
+    check("--version",
+          ["--version"],
+          must_contain="")  # just no crash
 
-check("genpass (default length)",
-      ["genpass"],
-      must_contain="Generated Password")
+    check("genpass (default length)",
+          ["genpass"],
+          must_contain="Generated Password")
 
-check("genpass --length 16",
-      ["genpass", "--length", "16"],
-      must_contain="Generated Password")
+    check("genpass --length 16",
+          ["genpass", "--length", "16"],
+          must_contain="Generated Password")
 
-check("genpass --length 32",
-      ["genpass", "--length", "32"],
-      must_contain="Generated Password")
+    check("genpass --length 32",
+          ["genpass", "--length", "32"],
+          must_contain="Generated Password")
 
-check("genpass --length 7 (too short)",
-      ["genpass", "--length", "7"],
-      must_contain="Length must be between")
+    check("genpass --length 7 (too short)",
+          ["genpass", "--length", "7"],
+          must_contain="Length must be between")
 
-check("genpass --length 129 (too long)",
-      ["genpass", "--length", "129"],
-      must_contain="Length must be between")
+    check("genpass --length 129 (too long)",
+          ["genpass", "--length", "129"],
+          must_contain="Length must be between")
 
-check("genpass --help",
-      ["genpass", "--help"],
-      must_contain="")
+    check("genpass --help",
+          ["genpass", "--help"],
+          must_contain="")
 
-# ── Help for every subcommand ─────────────────────────────────────────────────
+    # ── Help for every subcommand ─────────────────────────────────────────────────
 
-for cmd in [
-    "login", "lock", "add", "list", "get", "search", "update",
-    "delete", "restore", "totp", "backup", "import", "export",
-    "vaults", "switch", "recovery", "forget-masterpass",
-    "status", "audit", "security", "self-destruct", "copy", "config",
-]:
-    check(f"{cmd} --help", [cmd, "--help"], must_contain="")
+    for cmd in [
+        "login", "lock", "add", "list", "get", "search", "update",
+        "delete", "restore", "totp", "backup", "import", "export",
+        "vaults", "switch", "recovery", "forget-masterpass",
+        "status", "audit", "security", "self-destruct", "copy", "config",
+    ]:
+        check(f"{cmd} --help", [cmd, "--help"], must_contain="")
 
-# ── Vault-locked commands (should prompt for password, not crash) ─────────────
-# We send a blank password — vault will reject it but should NOT traceback.
+    # ── Vault-locked commands (should prompt for password, not crash) ─────────────
+    # We send a blank password — vault will reject it but should NOT traceback.
 
-for cmd in ["list", "add", "get", "search", "update", "delete",
-            "restore", "backup", "export", "audit", "status"]:
-    check(f"{cmd} (locked, blank input)",
-          [cmd],
-          input_text="\n\n\n",
+    for cmd in ["list", "add", "get", "search", "update", "delete",
+                "restore", "backup", "export", "audit", "status"]:
+        check(f"{cmd} (locked, blank input)",
+              [cmd],
+              input_text="\n\n\n",
+              must_not_contain="Traceback")
+
+    # ── Unknown command ───────────────────────────────────────────────────────────
+
+    check("unknown command",
+          ["foobar"],
+          must_contain="",          # just no traceback
           must_not_contain="Traceback")
 
-# ── Unknown command ───────────────────────────────────────────────────────────
+    # ── --no-color flag ───────────────────────────────────────────────────────────
 
-check("unknown command",
-      ["foobar"],
-      must_contain="",          # just no traceback
-      must_not_contain="Traceback")
+    check("--no-color genpass",
+          ["--no-color", "genpass"],
+          must_contain="Generated Password")
 
-# ── --no-color flag ───────────────────────────────────────────────────────────
+    # ── Print results ─────────────────────────────────────────────────────────────
 
-check("--no-color genpass",
-      ["--no-color", "genpass"],
-      must_contain="Generated Password")
+    print("\n" + "=" * 60)
+    print("  SENTRA COMMAND SMOKE TESTS")
+    print("=" * 60)
 
-# ── Print results ─────────────────────────────────────────────────────────────
+    passed = sum(1 for r in results if r[0] == PASS)
+    failed = sum(1 for r in results if r[0] == FAIL)
 
-print("\n" + "=" * 60)
-print("  SENTRA COMMAND SMOKE TESTS")
-print("=" * 60)
+    for status, label, reason, snippet in results:
+        if status == PASS:
+            print(f"  {PASS}  {label}")
+        else:
+            print(f"  {FAIL}  {label}")
+            print(f"       reason : {reason}")
+            if snippet:
+                print(f"       output : {snippet[:200]!r}")
 
-passed = sum(1 for r in results if r[0] == PASS)
-failed = sum(1 for r in results if r[0] == FAIL)
+    print("=" * 60)
+    print(f"  {passed} passed  |  {failed} failed  |  {len(results)} total")
+    print("=" * 60 + "\n")
 
-for status, label, reason, snippet in results:
-    if status == PASS:
-        print(f"  {PASS}  {label}")
-    else:
-        print(f"  {FAIL}  {label}")
-        print(f"       reason : {reason}")
-        if snippet:
-            print(f"       output : {snippet[:200]!r}")
-
-print("=" * 60)
-print(f"  {passed} passed  |  {failed} failed  |  {len(results)} total")
-print("=" * 60 + "\n")
-
-sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if failed == 0 else 1)

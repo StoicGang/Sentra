@@ -128,4 +128,19 @@ def build_parser() -> argparse.ArgumentParser:
     sw = sub.add_parser("switch", help="Switch vault")
     sw.add_argument("name", nargs="?")
 
+    # sync
+    sync = sub.add_parser("sync", help="P2P Synchronization")
+    sync_sub = sync.add_subparsers(dest="action")
+    sync_sub.add_parser("pair", help="Generate pairing token")
+    confirm = sync_sub.add_parser("confirm", help="Confirm pairing")
+    confirm.add_argument("payload", help="Pairing JSON payload")
+    sync_sub.add_parser("list", help="List trusted devices")
+    sync_sub.add_parser("status", help="Show sync status")
+    sync_sub.add_parser("now", help="Trigger immediate sync")
+
+    # daemon
+    daemon_parser = sub.add_parser("daemon", help="Start sync daemon")
+    daemon_parser.add_argument("--host", default="0.0.0.0", help="Host IP to bind to")
+    daemon_parser.add_argument("--port", "-p", type=int, default=5555, help="Port to bind to")
+
     return parser

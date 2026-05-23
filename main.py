@@ -12,27 +12,44 @@ from cli.shell import run_shell
 from cli.ui import print_error
 from cli.colors import colors
 
-
 def main():
+    from src.config import DB_PATH
+    print(f"DEBUG: Using database at: {DB_PATH}")
     parser = build_parser()
+    
+    # Custom sync action parsing
+    # Parse all arguments using the defined parser. Subcommands for 'sync' are handled via argparse.
+    args = parser.parse_args()
 
-    # No args → drop into interactive shell
-    if len(sys.argv) == 1:
+    # Early exit for no-arg shell
+    if args.command is None and len(sys.argv) == 1:
         cli = _build_cli()
         run_shell(cli, parser)
         return
 
-    args = parser.parse_args()
-
     if args.no_color:
         colors.disable()
+
+    # Dispatch logic
+    if args.command == "daemon":
+        from cli.daemon.network_daemon import NetworkDaemon
+        daemon = NetworkDaemon(host=args.host, port=args.port)
+        try:
+            daemon.run()
+        except KeyboardInterrupt:
+            daemon.stop()
+        return
+
+    if args.command == "sync":
+        from cli.commands.sync_commands import cmd_sync
+        cmd_sync(args)
+        return
 
     if not args.command:
         parser.print_help()
         return
 
     cli = _build_cli()
-
     _dispatch(cli, args, parser)
 
 
