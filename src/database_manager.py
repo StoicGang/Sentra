@@ -155,55 +155,6 @@ class DatabaseManager:
         except Exception as e:
             raise DatabaseError(f"Failed to retrieve all entries: {e}")
 
-    def list_entries(
-        self,
-        include_deleted: bool = False,
-        category: str = None,
-        favorite: bool = None,
-        limit: int = 100,
-        last_timestamp: str = None,
-        last_id: str = None
-    ) -> List[Dict]:
-        """
-        Return metadata-only rows from the entries table.
-        No decryption — password/notes blobs are never touched.
-        Supports cursor-based pagination via (last_timestamp, last_id).
-        """
-        try:
-            conn = self.connect()
-            conditions = []
-            params = []
-
-            if not include_deleted:
-                conditions.append("is_deleted = 0")
-            if category:
-                conditions.append("category = ?")
-                params.append(category)
-            if favorite is not None:
-                conditions.append("favorite = ?")
-                params.append(1 if favorite else 0)
-            if last_timestamp and last_id:
-                conditions.append("(modified_at < ? OR (modified_at = ? AND id < ?))")
-                params.extend([last_timestamp, last_timestamp, last_id])
-
-            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-            params.append(limit)
-
-            sql = f"""
-                SELECT id, title, url, username, tags, category, favorite,
-                       password_strength, created_at, modified_at, is_deleted
-                FROM entries
-                {where}
-                ORDER BY modified_at DESC, id DESC
-                LIMIT ?
-            """
-            cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            raise DatabaseError(f"Failed to list entries: {e}")
-
-
     @staticmethod
     def _validate_entry_data(
         title: Optional[str] = None,
@@ -347,22 +298,8 @@ class DatabaseManager:
                 cursor = conn.execute("PRAGMA table_info(entries)")
                 columns = {row[1] for row in cursor.fetchall()}
 
-                if 'totp_secret_encrypted' not in columns:
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_encrypted BLOB")
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_nonce BLOB")
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_tag BLOB")
-            except Exception as e:
-                raise DatabaseError(f"TOTP schema upgrade failed: {e}")
-
-            # --- Migration Section: TOTP Secret Storage (v2.4) ---
-            try:
-                cursor = conn.execute("PRAGMA table_info(entries)")
-                columns = {row[1] for row in cursor.fetchall()}
-
-                if 'totp_secret_encrypted' not in columns:
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_encrypted BLOB")
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_nonce BLOB")
-                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret_tag BLOB")
+                if 'totp_secret' not in columns:
+                    conn.execute("ALTER TABLE entries ADD COLUMN totp_secret BLOB")
             except Exception as e:
                 raise DatabaseError(f"TOTP schema upgrade failed: {e}")
 
@@ -1002,13 +939,13 @@ class DatabaseManager:
             where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
             sql = f"""
                 SELECT id, title, url, username, tags, category, favorite,
-                       password_strength, created_at, modified_at, is_deleted,
-                       CASE WHEN totp_secret IS NOT NULL AND totp_secret != '' THEN 1 ELSE 0 END AS has_totp
+                       password_strength, created_at, modified_at, is_deleted
                 FROM entries
-                {where}
+                {where_clause}
                 ORDER BY modified_at DESC, id DESC
                 LIMIT ?
             """
+            
             params.append(limit)
 
             cursor = conn.execute(sql, tuple(params))

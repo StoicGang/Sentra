@@ -86,7 +86,12 @@ CREATE TABLE IF NOT EXISTS entries (
     
     -- Soft Delete
     is_deleted INTEGER DEFAULT 0 CHECK (is_deleted IN (0, 1)),
-    deleted_at TEXT                         
+    deleted_at TEXT,
+
+    -- TOTP Support
+    totp_secret_encrypted BLOB,
+    totp_secret_nonce BLOB,
+    totp_secret_tag BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_category_active 
