@@ -19,11 +19,13 @@ temp/
 
 # Sentra specific
 docs/
+!docs/sync/
 data/manager.db
 data/backups/
 *.enc
 *.csv
 *.yaml
+!.github/**/*.yaml
 *.db
 *.db-shm
 *.db-wal

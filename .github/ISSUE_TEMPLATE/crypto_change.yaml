@@ -1,0 +1,37 @@
+name: "Cryptographic Change"
+description: "Propose a modification to crypto primitives or key lifecycle."
+labels: ["security", "crypto"]
+body:
+  - type: textarea
+    id: rationale
+    attributes:
+      label: "Rationale"
+      description: "Why is this change necessary? Reference any CVEs, audit findings, or spec updates."
+    validations:
+      required: true
+
+  - type: textarea
+    id: threat-analysis
+    attributes:
+      label: "Threat Analysis"
+      description: "Identify potential misuse (e.g. side-channels, nonce reuse, key reuse across protocols)."
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: "Implementation Details"
+      description: "Which files, functions, and key paths are affected?"
+
+  - type: checkboxes
+    id: validation
+    attributes:
+      label: "Validation"
+      options:
+        - label: "KAT (Known Answer Tests) passing"
+        - label: "SecureMemory wrappers used"
+        - label: "No plaintext key material logged or stored"
+        - label: "Noise session keys zeroized after use"
+        - label: "Ed25519 ↔ X25519 conversion correctness verified"
+        - label: "Approved by 2 Security Engineers"

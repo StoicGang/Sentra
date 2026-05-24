@@ -1,0 +1,97 @@
+name: "P2P Sync Issue"
+description: "Report a sync, pairing, daemon, or network connectivity issue."
+labels: ["bug", "sync", "p2p"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for any issue related to P2P synchronization — pairing, daemon, sync now, transport, or data consistency.
+
+  - type: dropdown
+    id: sync-area
+    attributes:
+      label: "Sync Area"
+      description: "Which part of the sync flow is affected?"
+      options:
+        - Pairing (sync pair / sync confirm)
+        - Device Management (sync list / sync unpair)
+        - Daemon Startup / Binding
+        - Network Connectivity / Firewall
+        - Noise Handshake / Authentication
+        - Delta Sync / Data Exchange
+        - Data Consistency (missing/duplicate entries)
+        - Tombstone / Deletion Propagation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Issue Description"
+      description: "Describe the problem clearly."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps to Reproduce"
+      description: "Exact commands run on each machine, in order."
+      placeholder: |
+        Machine A (Windows):
+        1. python main.py sync pair
+        2. python main.py daemon --host 0.0.0.0 --port 5555 --allow-ip <IP>
+
+        Machine B (Linux):
+        1. python main.py sync confirm '<payload>'
+        2. python main.py sync now --host <IP> --port 5555
+    validations:
+      required: true
+
+  - type: textarea
+    id: daemon-logs
+    attributes:
+      label: "Daemon Logs"
+      description: "Paste the full daemon terminal output (timestamps, handshake, errors)."
+      render: shell
+
+  - type: textarea
+    id: initiator-logs
+    attributes:
+      label: "Initiator Logs"
+      description: "Paste the output from the `sync now` command."
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment"
+      description: "OS, Python version, IPs, and network setup for both machines."
+      placeholder: |
+        Machine A:
+        - OS: Windows 11
+        - IP: 192.168.x.x
+        - Python: 3.12.x
+
+        Machine B:
+        - OS: Kali Linux 2026.1
+        - IP: 192.168.x.x
+        - Python: 3.12.x
+
+        Network: Same LAN / Bridged VM / NAT
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: troubleshooting
+    attributes:
+      label: "Troubleshooting Checklist"
+      description: "Confirm you've tried these before submitting."
+      options:
+        - label: "Both machines can `ping` each other"
+        - label: "Pairing completed on BOTH sides (pair on A → confirm on B, pair on B → confirm on A)"
+        - label: "`sync list` shows the peer as Trusted on both machines"
+        - label: "Daemon is running on the target machine (`netstat`/`ss` confirms LISTENING)"
+        - label: "Windows Firewall Python Block rules disabled (see README)"
+        - label: "`--allow-ip` includes the initiator's IP"

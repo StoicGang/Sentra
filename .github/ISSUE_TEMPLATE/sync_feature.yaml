@@ -1,0 +1,37 @@
+name: "Sync Engine Feature"
+description: "Propose a new synchronization feature or enhancement."
+labels: ["enhancement", "sync", "distributed-systems"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: "Feature Description"
+      description: "Explain the proposed change and what problem it solves."
+    validations:
+      required: true
+
+  - type: textarea
+    id: security-impact
+    attributes:
+      label: "Security & Plaintext Review"
+      description: "Does this change touch decrypted data? How is exposure minimized?"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklists
+    attributes:
+      label: "Requirements"
+      options:
+        - label: "HLC correctness verified"
+        - label: "Zeroization logic included"
+        - label: "Replay protection tested"
+        - label: "Rollback migration provided"
+        - label: "Tombstone propagation considered"
+        - label: "Tested with bidirectional sync (both directions)"
+
+  - type: textarea
+    id: test-plan
+    attributes:
+      label: "Testing Plan"
+      description: "How will this be verified? Include commands and expected outcomes."
