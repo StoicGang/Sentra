@@ -41,21 +41,25 @@ class DeltaEngine:
         Generates a delta batch of operations to send to a peer.
         Includes new/updated entries and tombstones since the last synced HLC.
         """
+        since_hlc = since_hlc if since_hlc else "0:0:local"
         conn = self.db.connect()
         operations = []
-        max_hlc_in_delta = since_hlc if since_hlc else "0:0:local" # Initialize with a very old HLC
+        max_hlc_in_delta = since_hlc # Initialize with the starting HLC
 
         # 1. Fetch new/updated entries
         entry_query = "SELECT id, hlc, origin_device_id, title, password_encrypted, password_nonce, password_tag, kdf_salt, created_at, modified_at FROM entries WHERE hlc > ? ORDER BY hlc, id LIMIT ?"
         entry_cursor = conn.execute(entry_query, (since_hlc, limit))
         
+        def to_hex(val):
+            return val.hex() if isinstance(val, bytes) else val
+
         for row in entry_cursor.fetchall():
             op_payload = {
                 "title": row['title'],
-                "password_encrypted": row['password_encrypted'],
-                "password_nonce": row['password_nonce'],
-                "password_tag": row['password_tag'],
-                "kdf_salt": row['kdf_salt'],
+                "password_encrypted": to_hex(row['password_encrypted']),
+                "password_nonce": to_hex(row['password_nonce']),
+                "password_tag": to_hex(row['password_tag']),
+                "kdf_salt": to_hex(row['kdf_salt']),
                 "created_at": row['created_at'],
                 "modified_at": row['modified_at']
                 # Add other encrypted/metadata fields here
@@ -103,6 +107,24 @@ class DeltaEngine:
 
         # 1. Verify integrity/order of remote_delta (e.g. from manifest if we had one here)
         # For now, rely on HLC in transaction manager
+
+        # Convert hex strings back to bytes for database
+        byte_keys = {
+            "password_encrypted", "password_nonce", "password_tag", "kdf_salt",
+            "title_encrypted", "title_nonce", "title_tag",
+            "url_encrypted", "url_nonce", "url_tag",
+            "username_encrypted", "username_nonce", "username_tag",
+            "totp_secret_encrypted", "totp_secret_nonce", "totp_secret_tag", "totp_secret"
+        }
+        for op in operations:
+            payload = op.get("payload")
+            if payload:
+                for k in byte_keys:
+                    if k in payload and isinstance(payload[k], str):
+                        try:
+                            payload[k] = bytes.fromhex(payload[k])
+                        except ValueError:
+                            pass
 
         # 2. Apply batch atomically
         self.transaction_manager.apply_sync_batch(peer_id, operations)

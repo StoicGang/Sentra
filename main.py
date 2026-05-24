@@ -33,11 +33,22 @@ def main():
     # Dispatch logic
     if args.command == "daemon":
         from cli.daemon.network_daemon import NetworkDaemon
-        daemon = NetworkDaemon(host=args.host, port=args.port)
+        allow_ips = None
+        if args.allow_ip:
+            allow_ips = []
+            for ip_group in args.allow_ip:
+                for ip in ip_group.split(','):
+                    allow_ips.append(ip.strip())
+        daemon = NetworkDaemon(host=args.host, port=args.port, allow_ips=allow_ips)
         try:
             daemon.run()
         except KeyboardInterrupt:
             daemon.stop()
+        return
+
+    if args.command == "debug-transport":
+        from cli.daemon.debug_transport import run_debug_transport
+        run_debug_transport(args.host, args.port)
         return
 
     if args.command == "sync":

@@ -44,6 +44,7 @@ Available commands:
   self-destruct  Configure self-destruct
   copy           Copy last viewed password
   config         Application configuration
+  sync           P2P Synchronization
   help           Show this help
   exit / quit    Exit Sentra
 """
@@ -122,6 +123,7 @@ def _dispatch(cli, args):
     from cli.commands.tools import cmd_copy
     from cli.commands.config import cmd_config
     from cli.auth import cmd_login, cmd_lock
+    from cli.commands.sync_commands import cmd_sync
 
     dispatch = {
         "login":             lambda: cmd_login(cli, args),
@@ -148,6 +150,7 @@ def _dispatch(cli, args):
         "self-destruct":     lambda: cmd_self_destruct(cli, args),
         "copy":              lambda: cmd_copy(cli, args),
         "config":            lambda: cmd_config(cli, args),
+        "sync":              lambda: cmd_sync(args),
     }
 
     handler = dispatch.get(args.command)

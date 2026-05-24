@@ -14,6 +14,15 @@ class IdentityManager:
 
     def ensure_identity(self) -> Dict[str, bytes]:
         """Ensures a device identity exists, generating if necessary."""
+        from src.storage.device_repository import DeviceRepository
+        repo = DeviceRepository(self.db)
+        existing = repo.get_local_identity()
+        if existing:
+            return {
+                "device_id": existing["device_id"],
+                "public_key": existing["public_key"]
+            }
+
         # Simple implementation for MVP identity storage.
         # In production, private_key_encrypted would be encrypted by the master key.
         priv = ed25519.Ed25519PrivateKey.generate()
@@ -22,12 +31,20 @@ class IdentityManager:
         
         device_id = hashlib.sha256(pub).hexdigest()
         
-        # Store in local_identity
-        conn = self.db.connect()
-        conn.execute("""
-            INSERT OR REPLACE INTO local_identity (id, device_id, public_key, private_key_encrypted, nonce, tag)
-            VALUES (1, ?, ?, ?, ?, ?)
-        """, (device_id, pub, priv_bytes, b"n", b"t"))
-        conn.commit()
+        repo.store_local_identity(device_id, pub, priv_bytes, b"n", b"t")
         
         return {"device_id": device_id, "public_key": pub}
+
+def ed25519_pub_to_x25519(ed_pub_bytes: bytes) -> bytes:
+    y_bytes = bytearray(ed_pub_bytes)
+    y_bytes[31] &= 0x7F
+    y = int.from_bytes(y_bytes, 'little')
+    
+    p = 2**255 - 19
+    u = (1 + y) * pow(1 - y, p - 2, p) % p
+    return u.to_bytes(32, 'little')
+
+def ed25519_priv_to_x25519(ed_priv_bytes: bytes) -> bytes:
+    import hashlib
+    h = hashlib.sha512(ed_priv_bytes).digest()
+    return h[:32]

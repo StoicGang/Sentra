@@ -58,7 +58,7 @@ class DatabaseManager:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
-        self.connection: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
         self._conn_lock = threading.Lock()
         # Ensure data directory exists
         directory = os.path.dirname(self.db_path)
@@ -73,6 +73,11 @@ class DatabaseManager:
         except Exception as e:
             raise RuntimeError(f"Database directory is not writable: {directory}") from e
     
+    @property
+    def connection(self) -> Optional[sqlite3.Connection]:
+        """Get the thread-local database connection if one exists."""
+        return getattr(self._local, "connection", None)
+    
     def connect(self) -> sqlite3.Connection:
         """ 
         Create or return existing database connection
@@ -81,39 +86,42 @@ class DatabaseManager:
             SQLite connection object with Row factory    
         """
         with self._conn_lock:
-            if self.connection is not None:
-                return self.connection
-            if self.connection is None:
-                self.connection = sqlite3.connect(self.db_path)
-                self.connection.row_factory = sqlite3.Row
-                self.connection.execute("PRAGMA foreign_keys = ON")
+            conn = getattr(self._local, "connection", None)
+            if conn is not None:
+                return conn
+            
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
 
-                # Try WAL mode directly on the main connection
-                res = self.connection.execute("PRAGMA journal_mode=WAL;").fetchone()
-                actual_mode = res[0].lower() if res else None
+            # Try WAL mode directly on the main connection
+            res = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+            actual_mode = res[0].lower() if res else None
 
-                if actual_mode != "wal":
-                    # Fallback to DELETE
-                    res = self.connection.execute("PRAGMA journal_mode=DELETE;").fetchone()
-                    fallback_mode = res[0].lower() if res else None
+            if actual_mode != "wal":
+                # Fallback to DELETE
+                res = conn.execute("PRAGMA journal_mode=DELETE;").fetchone()
+                fallback_mode = res[0].lower() if res else None
 
-                    if fallback_mode != "delete":
-                        raise RuntimeError(
-                            f"SQLite journaling misconfigured: WAL unsupported and DELETE fallback failed (mode={fallback_mode})"
-                        )
+                if fallback_mode != "delete":
+                    raise RuntimeError(
+                        f"SQLite journaling misconfigured: WAL unsupported and DELETE fallback failed (mode={fallback_mode})"
+                    )
 
-            return self.connection
+            self._local.connection = conn
+            return conn
 
     def close(self):
         """
         close the database connection
         """
-        if self.connection:
+        conn = getattr(self._local, "connection", None)
+        if conn:
             try:
-                self.connection.commit()
+                conn.commit()
             finally:
-                self.connection.close()
-                self.connection = None
+                conn.close()
+                self._local.connection = None
 
     def __enter__(self):
         """Context manager entry - auto-connect"""
@@ -331,20 +339,95 @@ class DatabaseManager:
                 cursor = conn.execute("PRAGMA table_info(vault_metadata)")
                 columns = {row[1] for row in cursor.fetchall()}
                 
-                if 'display_name' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN display_name TEXT")
-                if 'description' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN description TEXT")
-                if 'username' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN username TEXT DEFAULT 'admin'")
-                if 'account_status' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN account_status TEXT DEFAULT 'Active'")
-                if 'preferences' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN preferences TEXT DEFAULT '{}'")
-                if 'auto_lock_duration' not in columns:
-                    conn.execute("ALTER TABLE vault_metadata ADD COLUMN auto_lock_duration INTEGER DEFAULT 900")
+                if columns:
+                    if 'display_name' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN display_name TEXT")
+                    if 'description' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN description TEXT")
+                    if 'username' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN username TEXT DEFAULT 'admin'")
+                    if 'account_status' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN account_status TEXT DEFAULT 'Active'")
+                    if 'preferences' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN preferences TEXT DEFAULT '{}'")
+                    if 'auto_lock_duration' not in columns:
+                        conn.execute("ALTER TABLE vault_metadata ADD COLUMN auto_lock_duration INTEGER DEFAULT 900")
             except Exception as e:
                 raise DatabaseError(f"Vault metadata schema upgrade failed: {e}")
+
+            # --- Migration Section: Sync Support (v2.5 / 004) ---
+            try:
+                # 1. Create tables if they do not exist
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS trusted_devices (
+                        device_id TEXT PRIMARY KEY,
+                        public_key BLOB NOT NULL,
+                        nickname TEXT,
+                        trust_level INTEGER DEFAULT 1,
+                        last_synced_hlc TEXT,
+                        added_at TEXT DEFAULT (datetime('now')),
+                        last_seen_at TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sync_journal (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        peer_id TEXT,
+                        entry_id TEXT,
+                        prev_hlc TEXT,
+                        status TEXT DEFAULT 'PENDING',
+                        started_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY(peer_id) REFERENCES trusted_devices(device_id)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tombstones (
+                        entry_id TEXT PRIMARY KEY,
+                        deleted_hlc TEXT NOT NULL,
+                        origin_device_id TEXT NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS local_identity (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        device_id TEXT NOT NULL,
+                        public_key BLOB NOT NULL,
+                        private_key_encrypted BLOB NOT NULL,
+                        nonce BLOB NOT NULL,
+                        tag BLOB NOT NULL
+                    )
+                """)
+
+                # 2. Add columns to entries if they do not exist
+                cursor = conn.execute("PRAGMA table_info(entries)")
+                columns = {row[1] for row in cursor.fetchall()}
+
+                if columns:
+                    if 'hlc' not in columns:
+                        conn.execute("ALTER TABLE entries ADD COLUMN hlc TEXT")
+                    if 'origin_device_id' not in columns:
+                        conn.execute("ALTER TABLE entries ADD COLUMN origin_device_id TEXT DEFAULT 'local'")
+
+                    # 3. Seed HLC for existing entries using their modified_at timestamp if NULL
+                    if 'modified_at' in columns:
+                        conn.execute("""
+                            UPDATE entries 
+                            SET hlc = strftime('%s', modified_at) || ':0000:local'
+                            WHERE hlc IS NULL
+                        """)
+                    else:
+                        conn.execute("""
+                            UPDATE entries 
+                            SET hlc = strftime('%s', 'now') || ':0000:local'
+                            WHERE hlc IS NULL
+                        """)
+
+                # 4. Create Indexes
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_hlc ON entries(hlc)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_origin ON entries(origin_device_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_trusted_devices_trust ON trusted_devices(trust_level)")
+            except Exception as e:
+                raise DatabaseError(f"Sync schema upgrade failed: {e}")
             
             conn.commit()
             return True

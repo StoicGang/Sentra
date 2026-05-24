@@ -107,14 +107,24 @@ class NoiseSessionManager:
             # If we are the initiator, reading Msg 2 completes the handshake
             self.noise.read_message(data)
             
+            # Extract peer static key before it's deleted during write_message()
+            peer_pub = None
+            if not self.is_initiator:
+                try:
+                    hs = getattr(self.noise.noise_protocol, 'handshake_state', None)
+                    if hs and getattr(hs, 'rs', None):
+                        peer_pub = hs.rs.public_bytes
+                except Exception:
+                    pass
+            
             if self.noise.handshake_finished:
-                self._finalize_handshake()
+                self._finalize_handshake(peer_pub)
                 return None
             
             if not self.is_initiator:
                 response = self.noise.write_message()
                 if self.noise.handshake_finished:
-                    self._finalize_handshake()
+                    self._finalize_handshake(peer_pub)
                 return response
                 
             return None
@@ -134,28 +144,45 @@ class NoiseSessionManager:
             self.abort(f"Handshake failed: {e}")
             raise NoiseSessionError(f"Handshake failed: {e}")
 
-    def _finalize_handshake(self):
+    def _finalize_handshake(self, extracted_peer_pub=None):
         # noiseprotocol handles the crypto. We need to extract the learned identity if Responder.
-        peer_pub = None
-        try:
-            # For IK Responder, the initiator's static key is 'rs' in the handshake state
-            # Note: noise-python (noiseprotocol) might have different internal names.
-            # Based on source, handshake_state has 'rs'.
-            hs = getattr(self.noise.noise_protocol, 'handshake_state', None)
-            if hs:
-                rs_obj = getattr(hs, 'rs', None)
-                if rs_obj:
-                    # In some versions it's public_bytes, in others it's just bytes
-                    peer_pub = getattr(rs_obj, 'public_bytes', bytes(rs_obj) if rs_obj else None)
-        except Exception:
-            pass
+        peer_pub = extracted_peer_pub
+        if not peer_pub:
+            try:
+                # Fallback check if it was not passed (e.g. Initiator side where it might be in noise.rs)
+                hs = getattr(self.noise.noise_protocol, 'handshake_state', None)
+                if hs:
+                    rs_obj = getattr(hs, 'rs', None)
+                    if rs_obj:
+                        peer_pub = getattr(rs_obj, 'public_bytes', bytes(rs_obj) if rs_obj else None)
+            except Exception:
+                pass
 
         if not self.is_initiator and self.device_repo:
             if peer_pub:
-                device = self.device_repo.get_trusted_device(peer_pub.hex())
-                if not device or device.get('trust_level', 1) == 0:
+                from src.crypto.identity import ed25519_pub_to_x25519
+                matched_device = None
+                for device in self.device_repo.list_trusted_devices(include_revoked=True):
+                    db_ed25519_pub = device['public_key']
+                    try:
+                        db_x25519_pub = ed25519_pub_to_x25519(db_ed25519_pub)
+                        if db_x25519_pub == peer_pub:
+                            matched_device = device
+                            break
+                    except Exception:
+                        continue
+                
+                if not matched_device:
+                    # Fallback for mock tests where public keys are raw hex strings or simple bytes
+                    device = self.device_repo.get_trusted_device(peer_pub.hex())
+                    if device:
+                        matched_device = device
+                
+                if not matched_device or matched_device.get('trust_level', 1) == 0:
                     self.abort("Untrusted device")
                     raise IdentityMismatchError("Peer identity is not trusted or revoked")
+                
+                peer_pub = matched_device['public_key']
             else:
                 # If we couldn't extract PK but we expected to (Responder in IK)
                 # In some cases rs might be in self.noise.rs

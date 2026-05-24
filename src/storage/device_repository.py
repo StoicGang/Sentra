@@ -60,6 +60,59 @@ class DeviceRepository:
         except Exception as e:
             raise DatabaseError(f"Failed to revoke device: {e}")
 
+    def remove_device(self, device_id: str) -> bool:
+        """
+        Completely remove/unpair a device from the registry.
+        """
+        conn = None
+        try:
+            conn = self.db.connect()
+            conn.execute("BEGIN IMMEDIATE;")
+            
+            # 1. Resolve matching device_ids
+            if len(device_id) >= 8:
+                cursor = conn.execute("""
+                    SELECT device_id FROM trusted_devices 
+                    WHERE device_id = ? OR device_id LIKE ?
+                """, (device_id, f"{device_id}%"))
+            else:
+                cursor = conn.execute("""
+                    SELECT device_id FROM trusted_devices 
+                    WHERE device_id = ?
+                """, (device_id,))
+            
+            device_ids = [row['device_id'] for row in cursor.fetchall()]
+            if not device_ids:
+                conn.rollback()
+                return False
+                
+            # 2. Delete sync_operations and sync_journal entries for each resolved device
+            for d_id in device_ids:
+                # Find all batch_ids in sync_journal for this peer
+                cursor_batches = conn.execute("SELECT id FROM sync_journal WHERE peer_id = ?", (d_id,))
+                batch_ids = [r['id'] for r in cursor_batches.fetchall()]
+                
+                if batch_ids:
+                    # Create placeholders (?, ?, ...)
+                    placeholders = ", ".join(["?"] * len(batch_ids))
+                    # Ensure sync_operations table exists check first before deleting to avoid errors if not created yet
+                    cursor_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_operations'")
+                    if cursor_table.fetchone():
+                        conn.execute(f"DELETE FROM sync_operations WHERE batch_id IN ({placeholders})", tuple(batch_ids))
+                
+                conn.execute("DELETE FROM sync_journal WHERE peer_id = ?", (d_id,))
+                conn.execute("DELETE FROM trusted_devices WHERE device_id = ?", (d_id,))
+                
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise DatabaseError(f"Failed to remove device: {e}")
+
     def get_trusted_device(self, device_id: str) -> Optional[Dict]:
         """
         Retrieve a trusted device by its ID.

@@ -316,3 +316,4 @@ CREATE TABLE IF NOT EXISTS backup_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backup_history_timestamp ON backup_history(timestamp DESC);
+

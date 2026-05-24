@@ -136,11 +136,21 @@ def build_parser() -> argparse.ArgumentParser:
     confirm.add_argument("payload", help="Pairing JSON payload")
     sync_sub.add_parser("list", help="List trusted devices")
     sync_sub.add_parser("status", help="Show sync status")
-    sync_sub.add_parser("now", help="Trigger immediate sync")
+    now_parser = sync_sub.add_parser("now", help="Trigger immediate sync")
+    now_parser.add_argument("--host", required=True, help="IP address of the peer daemon")
+    now_parser.add_argument("--port", "-p", type=int, default=5555, help="Port of the peer daemon")
+    unpair_parser = sync_sub.add_parser("unpair", help="Unpair/remove a trusted device")
+    unpair_parser.add_argument("device_id", help="Device ID or prefix of the device to unpair")
 
     # daemon
     daemon_parser = sub.add_parser("daemon", help="Start sync daemon")
     daemon_parser.add_argument("--host", default="0.0.0.0", help="Host IP to bind to")
     daemon_parser.add_argument("--port", "-p", type=int, default=5555, help="Port to bind to")
+    daemon_parser.add_argument("--allow-ip", action="append", help="IP address allowed to connect (can be specified multiple times)")
+
+    # debug-transport
+    dt = sub.add_parser("debug-transport", help="Debug transport reachability")
+    dt.add_argument("--host", default="127.0.0.1", help="Target host IP")
+    dt.add_argument("--port", "-p", type=int, default=5555, help="Target port")
 
     return parser

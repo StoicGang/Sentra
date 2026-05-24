@@ -58,3 +58,11 @@ def test_revoked_device_listing(db, repo):
     
     devices_trusted = repo.list_trusted_devices(include_revoked=False)
     assert len(devices_trusted) == 0
+
+def test_device_removal(db, repo):
+    repo.add_device("peer-b", b"\x01" * 32, nickname="Peer B")
+    assert len(repo.list_trusted_devices()) == 1
+    
+    success = repo.remove_device("peer-b")
+    assert success is True
+    assert len(repo.list_trusted_devices(include_revoked=True)) == 0

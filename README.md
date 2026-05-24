@@ -18,6 +18,7 @@ A local-first password manager with a modular CLI. Sentra stores secrets in a lo
 - **Soft Delete & Restore** — Deleted entries go to trash before permanent removal.
 - **Audit Logging** — Vault operations (unlock, create, update, delete) are logged internally.
 - **Full-Text Search** — FTS5-powered search across unencrypted entry metadata.
+- **P2P Sync** — End-to-end encrypted device-to-device synchronization using the Noise IK protocol. Mutual authentication via Ed25519 key pairs, HLC-based delta sync, IP allowlisting, and tombstone-based deletion propagation. No cloud, no central server.
 - **Supply Chain Security** — Locked dependencies with SHA-256 hashes and CycloneDX SBOM.
 
 ## Threat Model & Limitations
@@ -127,6 +128,73 @@ python main.py <command> [options]
 | `self-destruct` | Configure or trigger vault deletion |
 | `copy` | Copy last viewed password or TOTP code |
 | `config` | Application settings (`--clipboard-timeout`) |
+| `sync pair` | Generate a pairing token for device-to-device trust |
+| `sync confirm <payload>` | Accept a remote device's pairing token |
+| `sync list` | List all trusted (paired) devices |
+| `sync unpair <device_id>` | Remove a device from the trusted list |
+| `sync now --host <IP>` | Trigger immediate sync with a peer daemon |
+| `sync status` | Show sync operational status |
+| `daemon` | Start the sync listener (`--host`, `--port`, `--allow-ip`) |
+| `debug-transport` | Test raw TCP reachability to a peer (`--host`, `--port`) |
+
+## P2P Sync
+
+Sentra supports encrypted peer-to-peer synchronization between devices on the same network. No cloud services or central server is involved — vaults sync directly over TCP using the [Noise Protocol Framework](https://noiseprotocol.org/) (IK handshake pattern).
+
+### How It Works
+
+```
+Machine A (Initiator)                    Machine B (Daemon)
+─────────────────────                    ──────────────────
+sync now --host <B_IP>  ──TCP connect──►  daemon --port 5555
+                        ◄─Noise IK──────►
+                        ──SYNC_INIT─────►
+                        ◄─SYNC_INIT_RESP─
+                        ──DELTA_DATA────►  (applies remote entries)
+                        ◄─DELTA_DATA─────  (applies remote entries)
+```
+
+### Quick Start
+
+```bash
+# 1. Pair devices (run on BOTH machines, exchange payloads)
+python main.py sync pair                          # generates a payload
+python main.py sync confirm '<payload_from_peer>'  # accepts the peer's payload
+
+# 2. Start daemon on the receiving machine
+python main.py daemon --host 0.0.0.0 --port 5555 --allow-ip <PEER_IP>
+
+# 3. Trigger sync from the other machine
+python main.py sync now --host <DAEMON_IP> --port 5555
+```
+
+### Security Model
+
+- **Mutual authentication** — Both peers verify each other's static Ed25519 public key during the Noise handshake.
+- **Forward secrecy** — Ephemeral Diffie-Hellman keys are used per session.
+- **IP allowlisting** — The daemon only accepts connections from explicitly allowed IPs (`--allow-ip`).
+- **Tombstone propagation** — Deleted entries propagate tombstones to prevent resurrection on peer devices.
+- **No plaintext transport** — All sync data (entries, deltas) is encrypted inside the Noise session.
+
+### Windows Firewall Note
+
+Windows may auto-create **Block rules for Python** when it first opens a listening socket. These override any port-based Allow rules and will silently prevent incoming sync connections.
+
+```powershell
+# Check for Python block rules (run as Administrator)
+Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True |
+  Where-Object { $_.DisplayName -eq "Python" } | Format-Table DisplayName, Action
+
+# Disable them if found
+Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True |
+  Where-Object { $_.DisplayName -eq "Python" } | Set-NetFirewallRule -Enabled False
+
+# Create explicit allow rule for Sentra
+New-NetFirewallRule -DisplayName "Sentra Sync" -Direction Inbound `
+  -Protocol TCP -LocalPort 5555 -RemoteAddress <PEER_IP> -Action Allow
+```
+
+For the full setup guide, troubleshooting, and debugging playbook, see [`docs/sync/P2P_SYNC_SETUP_AND_TROUBLESHOOTING.md`](docs/sync/P2P_SYNC_SETUP_AND_TROUBLESHOOTING.md).
 
 ## Development
 
